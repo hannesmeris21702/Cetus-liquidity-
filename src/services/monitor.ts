@@ -71,6 +71,12 @@ export class PositionMonitorService {
   async getPositions(ownerAddress: string): Promise<PositionInfo[]> {
     try {
       const sdk = this.sdkService.getSdk();
+      
+      if (!sdk) {
+        logger.warn('SDK not initialized - returning empty positions list');
+        return [];
+      }
+      
       const positions = await sdk.Position.getPositionList(ownerAddress);
 
       return positions.map((pos: any) => ({
