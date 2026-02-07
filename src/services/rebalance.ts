@@ -27,6 +27,7 @@ interface RemoveLiquidityParams {
   min_amount_b: string;
   coinTypeA: string;
   coinTypeB: string;
+  collect_fee: boolean;
   rewarder_coin_types: string[];
 }
 
@@ -219,6 +220,7 @@ export class RebalanceService {
         min_amount_b: '0',
         coinTypeA: position.tokenA,
         coinTypeB: position.tokenB,
+        collect_fee: true, // Collect fees when removing liquidity
         rewarder_coin_types: [], // No rewards for simplicity
       };
       
@@ -245,7 +247,11 @@ export class RebalanceService {
       });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.error('Failed to remove liquidity', { error: errorMsg });
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      logger.error(`Failed to remove liquidity: ${errorMsg}`);
+      if (errorStack) {
+        logger.error('Stack trace:', errorStack);
+      }
       
       // Provide helpful error messages
       if (errorMsg.includes('Position') || errorMsg.includes('not found')) {
@@ -395,7 +401,11 @@ export class RebalanceService {
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.error('Failed to add liquidity', { error: errorMsg });
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      logger.error(`Failed to add liquidity: ${errorMsg}`);
+      if (errorStack) {
+        logger.error('Stack trace:', errorStack);
+      }
       
       // Provide helpful error messages
       if (errorMsg.includes('insufficient') || errorMsg.includes('balance')) {
