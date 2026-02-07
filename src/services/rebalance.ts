@@ -18,6 +18,26 @@ export interface RebalanceResult {
   };
 }
 
+// Type definitions for SDK parameters to avoid using 'as any'
+interface RemoveLiquidityParams {
+  pool_id: string;
+  pos_id: string;
+  delta_liquidity: string;
+  min_amount_a: string;
+  min_amount_b: string;
+  coinTypeA: string;
+  coinTypeB: string;
+  rewarder_coin_types: string[];
+}
+
+interface OpenPositionParams {
+  pool_id: string;
+  tick_lower: string;
+  tick_upper: string;
+  coinTypeA: string;
+  coinTypeB: string;
+}
+
 export class RebalanceService {
   private sdkService: CetusSDKService;
   private monitorService: PositionMonitorService;
@@ -190,8 +210,8 @@ export class RebalanceService {
       logger.info('Building remove liquidity transaction');
 
       // Build remove liquidity transaction payload
-      // Note: Actual SDK method signature may vary by version
-      const removeLiquidityPayload = await sdk.Position.removeLiquidityTransactionPayload({
+      // Type-safe parameters for SDK call
+      const params: RemoveLiquidityParams = {
         pool_id: position.poolAddress,
         pos_id: positionId,
         delta_liquidity: liquidity,
@@ -200,7 +220,9 @@ export class RebalanceService {
         coinTypeA: position.tokenA,
         coinTypeB: position.tokenB,
         rewarder_coin_types: [], // No rewards for simplicity
-      } as any); // Using 'as any' to bypass strict type checking for SDK version differences
+      };
+      
+      const removeLiquidityPayload = await sdk.Position.removeLiquidityTransactionPayload(params as any); // Note: SDK types may vary by version
 
       // Sign and execute the transaction
       logger.info('Executing remove liquidity transaction');
@@ -271,11 +293,27 @@ export class RebalanceService {
       });
 
       // Use configured amounts or default to a portion of available balance
-      const amountA = this.config.tokenAAmount || String(Math.max(1000, Number(BigInt(balanceA.totalBalance) / 10n))); // Use 10% of balance or minimum 1000
-      const amountB = this.config.tokenBAmount || String(Math.max(1000, Number(BigInt(balanceB.totalBalance) / 10n)));
+      // Use BigInt arithmetic to avoid precision loss with large numbers
+      const balanceABigInt = BigInt(balanceA.totalBalance);
+      const balanceBBigInt = BigInt(balanceB.totalBalance);
+      const defaultMinAmount = 1000n;
+      
+      const amountA = this.config.tokenAAmount || String(balanceABigInt > 0n ? balanceABigInt / 10n : defaultMinAmount);
+      const amountB = this.config.tokenBAmount || String(balanceBBigInt > 0n ? balanceBBigInt / 10n : defaultMinAmount);
 
-      if (BigInt(amountA) === 0n || BigInt(amountB) === 0n) {
-        throw new Error('Insufficient token balance to add liquidity. Please ensure you have both tokens in your wallet.');
+      // Validate amounts
+      try {
+        const amountABigInt = BigInt(amountA);
+        const amountBBigInt = BigInt(amountB);
+        
+        if (amountABigInt === 0n || amountBBigInt === 0n) {
+          throw new Error('Insufficient token balance to add liquidity. Please ensure you have both tokens in your wallet.');
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('Cannot convert')) {
+          throw new Error('Invalid token amount configuration');
+        }
+        throw error;
       }
 
       logger.info('Opening new position with liquidity', {
@@ -285,15 +323,16 @@ export class RebalanceService {
         tickUpper,
       });
 
-      // Build open position transaction
-      // Note: The SDK API may vary by version. This is a general approach.
-      const openPositionPayload = await sdk.Position.openPositionTransactionPayload({
+      // Build open position transaction with type-safe parameters
+      const openParams: OpenPositionParams = {
         pool_id: poolInfo.poolAddress,
         tick_lower: tickLower.toString(),
         tick_upper: tickUpper.toString(),
         coinTypeA: poolInfo.coinTypeA,
         coinTypeB: poolInfo.coinTypeB,
-      } as any); // Using 'as any' to bypass strict type checking for SDK version differences
+      };
+      
+      const openPositionPayload = await sdk.Position.openPositionTransactionPayload(openParams as any); // Note: SDK types may vary by version
 
       // First, open the position
       logger.info('Opening position...');
@@ -316,11 +355,13 @@ export class RebalanceService {
       });
 
       // Extract the position NFT ID from the result
-      const positionNft = openResult.objectChanges?.find(
-        (change: any) => change.type === 'created' && change.objectType?.includes('Position')
+      // Search for created position object in transaction changes
+      const createdObjects = (openResult.objectChanges?.filter((change: any) => change.type === 'created') || []) as any[];
+      const positionObject = createdObjects.find((obj: any) => 
+        obj.objectType && typeof obj.objectType === 'string' && obj.objectType.includes('Position')
       );
 
-      if (!positionNft || !('objectId' in positionNft)) {
+      if (!positionObject || !positionObject.objectId) {
         // Position might be created but we couldn't extract the ID
         // Log success but note that we couldn't track the position ID
         logger.warn('Position created but could not extract position NFT ID from transaction result');
@@ -329,7 +370,8 @@ export class RebalanceService {
         };
       }
 
-      const positionId = positionNft.objectId;
+      // Extract the position ID (validated above)
+      const positionId: string = positionObject.objectId as string;
       logger.info('Position NFT created', { positionId });
 
       // Try to add liquidity to the position

@@ -37,12 +37,13 @@ export class CetusRebalanceBot {
       return;
     }
 
-    logger.info('Starting Cetus Rebalance Bot...');
+    logger.info('Initializing Cetus Rebalance Bot...');
 
     // Validate environment setup before starting
     await this.validateSetup();
 
     this.isRunning = true;
+    logger.info('Bot started successfully');
 
     // Perform initial check
     await this.performCheck();
@@ -52,7 +53,7 @@ export class CetusRebalanceBot {
       await this.performCheck();
     }, config.checkInterval * 1000);
 
-    logger.info(`Bot started - checking every ${config.checkInterval} seconds`);
+    logger.info(`Bot running - checking every ${config.checkInterval} seconds`);
   }
 
   private async validateSetup(): Promise<void> {
