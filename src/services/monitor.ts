@@ -35,19 +35,6 @@ export class PositionMonitorService {
   async getPoolInfo(poolAddress: string): Promise<PoolInfo> {
     try {
       const sdk = this.sdkService.getSdk();
-      
-      if (!sdk) {
-        logger.warn('SDK not initialized - using placeholder pool info');
-        return {
-          poolAddress,
-          currentTickIndex: 0,
-          currentSqrtPrice: '0',
-          coinTypeA: '',
-          coinTypeB: '',
-          tickSpacing: 1,
-        };
-      }
-      
       const pool = await sdk.Pool.getPool(poolAddress);
 
       return {
@@ -71,12 +58,6 @@ export class PositionMonitorService {
   async getPositions(ownerAddress: string): Promise<PositionInfo[]> {
     try {
       const sdk = this.sdkService.getSdk();
-      
-      if (!sdk) {
-        logger.warn('SDK not initialized - returning empty positions list');
-        return [];
-      }
-      
       const positions = await sdk.Position.getPositionList(ownerAddress);
 
       return positions.map((pos: any) => ({

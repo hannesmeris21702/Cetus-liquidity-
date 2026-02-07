@@ -134,16 +134,11 @@ export class RebalanceService {
       logger.info('Removing liquidity', { positionId, liquidity });
 
       const sdk = this.sdkService.getSdk();
-      
-      if (!sdk) {
-        logger.warn('SDK not initialized - skipping liquidity removal');
-        return;
-      }
 
       // Build remove liquidity transaction
       // Note: This is simplified - actual implementation depends on SDK API and configuration
       // The SDK method signature may vary based on version
-      logger.info('Building remove liquidity transaction (requires SDK configuration)');
+      logger.info('Building remove liquidity transaction');
       
       // Example (commented out - needs proper SDK setup):
       // const removeLiquidityPayload = await sdk.Position.removeLiquidityTransactionPayload({

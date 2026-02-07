@@ -1,19 +1,15 @@
 import { SuiClient } from '@mysten/sui.js/client';
 import { Ed25519Keypair } from '@mysten/sui.js/keypairs/ed25519';
+import { CetusClmmSDK } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import { BotConfig } from '../config';
+import { getSDKConfig } from '../config/sdkConfig';
 import { logger } from '../utils/logger';
 
 /**
  * Service for managing Cetus SDK and Sui client initialization.
- * 
- * Note: This is a framework implementation. For production use, you'll need to:
- * 1. Get the latest Cetus CLMM SDK configuration from: 
- *    https://cetus-1.gitbook.io/cetus-developer-docs/developer/via-sdk/getting-started
- * 2. Initialize CetusClmmSDK with proper package addresses for your network
- * 3. Implement the actual transaction building and signing logic
  */
 export class CetusSDKService {
-  private sdk: any; // CetusClmmSDK - type as any for now due to complex configuration requirements
+  private sdk: CetusClmmSDK;
   private suiClient: SuiClient;
   private keypair: Ed25519Keypair;
   private config: BotConfig;
@@ -22,13 +18,7 @@ export class CetusSDKService {
     this.config = config;
     this.keypair = this.initializeKeypair(config.privateKey);
     this.suiClient = this.initializeSuiClient(config);
-    
-    logger.warn('Cetus SDK initialization requires specific contract addresses.');
-    logger.warn('Please refer to: https://cetus-1.gitbook.io/cetus-developer-docs/developer/via-sdk/getting-started');
-    logger.warn('This bot provides the framework - you need to add proper SDK configuration for your network.');
-    
-    // SDK initialization would go here with proper configuration
-    // this.sdk = this.initializeSDK(config);
+    this.sdk = this.initializeSDK(config);
   }
 
   private initializeKeypair(privateKey: string): Ed25519Keypair {
@@ -62,32 +52,47 @@ export class CetusSDKService {
 
   /**
    * Initialize Cetus SDK with proper configuration.
-   * 
-   * Example configuration needed:
-   * ```typescript
-   * import CetusClmmSDK from '@cetusprotocol/cetus-sui-clmm-sdk';
-   * 
-   * const sdkOptions = {
-   *   fullRpcUrl: rpcUrl,
-   *   simulationAccount: { address: yourAddress },
-   *   cetus_config: { package_id: '...' },
-   *   clmm_pool: { package_id: '...' , published_at: '...' },
-   *   integrate: { package_id: '...' , published_at: '...' },
-   *   // ... other required packages
-   * };
-   * 
-   * const sdk = new CetusClmmSDK(sdkOptions);
-   * sdk.senderAddress = yourAddress;
-   * ```
+   * Uses network-specific configuration for mainnet or testnet.
    */
-  private initializeSDK(config: BotConfig): any {
-    // Placeholder for SDK initialization
-    // User needs to implement this with proper contract addresses
-    logger.info('SDK initialization placeholder - requires contract addresses for' + config.network);
-    return null;
+  private initializeSDK(config: BotConfig): CetusClmmSDK {
+    try {
+      logger.info(`Initializing Cetus SDK for ${config.network}`);
+      
+      const address = this.keypair.getPublicKey().toSuiAddress();
+      const rpcUrl = config.suiRpcUrl || this.getDefaultRpcUrl(config.network);
+      
+      // Get network-specific SDK configuration
+      const sdkConfig = getSDKConfig(config.network);
+      
+      // Override RPC URL and simulation account with user's settings
+      const sdkOptions = {
+        ...sdkConfig,
+        fullRpcUrl: rpcUrl,
+        simulationAccount: {
+          address,
+        },
+      };
+      
+      // Initialize the SDK
+      const sdk = new CetusClmmSDK(sdkOptions);
+      
+      // Set the sender address for transaction signing
+      sdk.senderAddress = address;
+      
+      logger.info(`Cetus SDK initialized successfully`, {
+        network: config.network,
+        address,
+        rpcUrl,
+      });
+      
+      return sdk;
+    } catch (error) {
+      logger.error('Failed to initialize Cetus SDK', error);
+      throw error;
+    }
   }
 
-  getSdk(): any {
+  getSdk(): CetusClmmSDK {
     return this.sdk;
   }
 
