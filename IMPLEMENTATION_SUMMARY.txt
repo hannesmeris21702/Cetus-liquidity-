@@ -1,0 +1,172 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║         CETUS LIQUIDITY BOT - TRANSACTION RETRY FIX IMPLEMENTATION         ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+┌─ PROBLEM ──────────────────────────────────────────────────────────────────┐
+│ Transaction failures due to stale object references:                       │
+│ • "Object ID ... is not available for consumption, current version: ..."   │
+│ • "Input ... has a transaction X seconds old pending..."                   │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ ROOT CAUSE ───────────────────────────────────────────────────────────────┐
+│ 1. Bot fetches blockchain objects (pools, positions)                       │
+│ 2. Another transaction updates these objects                               │
+│ 3. Bot's transaction fails with stale version                              │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ SOLUTION ─────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  NEW: retryTransaction() Helper Method                                     │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  • Exponential Backoff: 2s → 4s → 8s                                 │  │
+│  │  • Smart Error Detection: Retryable vs Non-retryable                 │  │
+│  │  • State Refetching: Fresh object versions on retry                  │  │
+│  │  • Max 3 Attempts: Fail-fast for real issues                         │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  APPLIED TO:                                                                │
+│  ✓ removeLiquidity() - Refetches position state                            │
+│  ✓ openPosition() - Refetches pool state                                   │
+│  ✓ addLiquidity() - Refetches pool state                                   │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ ERROR DETECTION ──────────────────────────────────────────────────────────┐
+│                                                                             │
+│  RETRYABLE ERRORS (will retry):                                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ Stale Objects:                                                       │  │
+│  │   • "is not available for consumption"                               │  │
+│  │   • "Version" + "Digest"                                             │  │
+│  │   • "current version:"                                               │  │
+│  │                                                                      │  │
+│  │ Pending Transactions:                                                │  │
+│  │   • "pending" + "seconds old"                                        │  │
+│  │   • "pending" + "above threshold"                                    │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│  NON-RETRYABLE ERRORS (fail immediately):                                  │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │   • Insufficient balance                                             │  │
+│  │   • Invalid parameters                                               │  │
+│  │   • Configuration errors                                             │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ FLOW DIAGRAM ─────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  Execute Transaction                                                        │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐      Success      ┌─────────────┐                         │
+│  │  Attempt 1  │ ──────────────────▶│   Return    │                         │
+│  └─────────────┘                    └─────────────┘                         │
+│         │                                                                   │
+│    Fail (Retryable)                                                         │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐                                                            │
+│  │   Wait 2s   │                                                            │
+│  │  Refetch    │                                                            │
+│  │   State     │                                                            │
+│  └─────────────┘                                                            │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐      Success      ┌─────────────┐                         │
+│  │  Attempt 2  │ ──────────────────▶│   Return    │                         │
+│  └─────────────┘                    └─────────────┘                         │
+│         │                                                                   │
+│    Fail (Retryable)                                                         │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐                                                            │
+│  │   Wait 4s   │                                                            │
+│  │  Refetch    │                                                            │
+│  │   State     │                                                            │
+│  └─────────────┘                                                            │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐      Success      ┌─────────────┐                         │
+│  │  Attempt 3  │ ──────────────────▶│   Return    │                         │
+│  └─────────────┘                    └─────────────┘                         │
+│         │                                                                   │
+│    Fail (Retryable)                                                         │
+│         │                                                                   │
+│         ▼                                                                   │
+│  ┌─────────────┐                                                            │
+│  │   Throw     │                                                            │
+│  │   Error     │                                                            │
+│  └─────────────┘                                                            │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ FILES MODIFIED ───────────────────────────────────────────────────────────┐
+│                                                                             │
+│  src/services/rebalance.ts                                                  │
+│  ├─ Added: retryTransaction() method        [+49 lines]                    │
+│  ├─ Updated: removeLiquidity() method       [+30, -29 lines]               │
+│  └─ Updated: addLiquidity() method          [+51, -24 lines]               │
+│                                                                             │
+│  Total Changes: +130 lines, -53 lines                                      │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ DOCUMENTATION ADDED ──────────────────────────────────────────────────────┐
+│                                                                             │
+│  TRANSACTION_RETRY_FIX.md              [174 lines]                          │
+│  └─ Comprehensive technical documentation                                  │
+│                                                                             │
+│  FIX_SUMMARY_TRANSACTION_RETRY.md      [75 lines]                           │
+│  └─ Executive summary and quick reference                                  │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ QUALITY CHECKS ───────────────────────────────────────────────────────────┐
+│                                                                             │
+│  ✓ TypeScript Compilation           PASSED                                 │
+│  ✓ Build Process                     PASSED                                 │
+│  ✓ Code Review                       COMPLETED                              │
+│  ✓ CodeQL Security Scan              PASSED (0 alerts)                      │
+│  ✓ No New Dependencies               VERIFIED                               │
+│  ⏳ Live Blockchain Testing           PENDING (requires user environment)   │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ EXPECTED BEHAVIOR ────────────────────────────────────────────────────────┐
+│                                                                             │
+│  BEFORE FIX:                          AFTER FIX:                            │
+│  ┌─────────────────────────────┐     ┌─────────────────────────────┐       │
+│  │ [INFO]  Executing tx...     │     │ [INFO]  Executing tx...     │       │
+│  │ [ERROR] Object not available│     │ [WARN]  Retryable error     │       │
+│  │ [ERROR] Rebalance failed    │     │ [INFO]  Retry attempt 2/3   │       │
+│  │ Bot stops                   │     │ [INFO]  Success!            │       │
+│  │                             │     │ Bot continues               │       │
+│  └─────────────────────────────┘     └─────────────────────────────┘       │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ COMMIT HISTORY ───────────────────────────────────────────────────────────┐
+│                                                                             │
+│  8b507af  Add fix summary documentation                                     │
+│  9c5a895  Add comprehensive documentation for transaction retry fix        │
+│  8b60584  Improve error detection and refetch state on all retry ops       │
+│  81e989b  Add retry logic with exponential backoff                          │
+│  4669901  Initial plan                                                      │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌─ NEXT STEPS ───────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  1. Deploy to production/test environment                                  │
+│  2. Run bot with actual blockchain transactions                            │
+│  3. Monitor logs for retry patterns                                        │
+│  4. Verify transactions succeed after retries                              │
+│  5. Track metrics: retry rate, success rate, error patterns                │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║                         IMPLEMENTATION COMPLETE ✓                          ║
+║                        Ready for Testing and Deployment                    ║
+╚════════════════════════════════════════════════════════════════════════════╝
