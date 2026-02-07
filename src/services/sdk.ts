@@ -1,8 +1,7 @@
 import { SuiClient } from '@mysten/sui.js/client';
 import { Ed25519Keypair } from '@mysten/sui.js/keypairs/ed25519';
-import { CetusClmmSDK } from '@cetusprotocol/cetus-sui-clmm-sdk';
+import { CetusClmmSDK, initCetusSDK } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import { BotConfig } from '../config';
-import { getSDKConfig } from '../config/sdkConfig';
 import { logger } from '../utils/logger';
 
 /**
@@ -80,7 +79,7 @@ export class CetusSDKService {
 
   /**
    * Initialize Cetus SDK with proper configuration.
-   * Uses network-specific configuration for mainnet or testnet.
+   * Uses the official initCetusSDK helper which provides up-to-date package addresses.
    */
   private initializeSDK(config: BotConfig): CetusClmmSDK {
     try {
@@ -89,20 +88,12 @@ export class CetusSDKService {
       const address = this.keypair.getPublicKey().toSuiAddress();
       const rpcUrl = config.suiRpcUrl || this.getDefaultRpcUrl(config.network);
       
-      // Get network-specific SDK configuration
-      const sdkConfig = getSDKConfig(config.network);
-      
-      // Override RPC URL and simulation account with user's settings
-      const sdkOptions = {
-        ...sdkConfig,
-        fullRpcUrl: rpcUrl,
-        simulationAccount: {
-          address,
-        },
-      };
-      
-      // Initialize the SDK
-      const sdk = new CetusClmmSDK(sdkOptions);
+      // Use the official initCetusSDK helper which includes the latest package addresses
+      const sdk = initCetusSDK({
+        network: config.network,
+        fullNodeUrl: rpcUrl,
+        wallet: address,
+      });
       
       // Set the sender address for transaction signing
       sdk.senderAddress = address;
