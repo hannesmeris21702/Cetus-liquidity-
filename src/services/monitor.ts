@@ -34,8 +34,20 @@ export class PositionMonitorService {
 
   async getPoolInfo(poolAddress: string): Promise<PoolInfo> {
     try {
+      logger.debug(`Fetching pool info for: ${poolAddress}`);
       const sdk = this.sdkService.getSdk();
       const pool = await sdk.Pool.getPool(poolAddress);
+
+      if (!pool) {
+        throw new Error(`Pool not found: ${poolAddress}. Please verify the pool address exists on ${this.config.network}.`);
+      }
+
+      logger.debug('Pool info retrieved successfully', {
+        poolAddress,
+        currentTick: pool.current_tick_index,
+        coinTypeA: pool.coinTypeA,
+        coinTypeB: pool.coinTypeB,
+      });
 
       return {
         poolAddress,
@@ -50,7 +62,27 @@ export class PositionMonitorService {
           : parseInt(pool.tickSpacing || '1'),
       };
     } catch (error) {
-      logger.error('Failed to get pool info', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Provide helpful error messages
+      if (errorMessage.includes('Pool not found')) {
+        logger.error(`Pool ${poolAddress} does not exist on ${this.config.network}. Please check:
+  1. The pool address is correct
+  2. You're connected to the right network (mainnet/testnet)
+  3. The pool exists on Cetus: https://app.cetus.zone/`);
+      } else if (errorMessage.includes('network') || errorMessage.includes('fetch') || errorMessage.includes('ECONNREFUSED')) {
+        logger.error(`Network error while fetching pool info. Please check:
+  1. Your internet connection
+  2. The RPC endpoint is accessible: ${this.config.suiRpcUrl || 'default'}
+  3. Try setting a custom SUI_RPC_URL in .env if using default`);
+      } else {
+        logger.error('Failed to get pool info', {
+          poolAddress,
+          network: this.config.network,
+          error: errorMessage,
+        });
+      }
+      
       throw error;
     }
   }

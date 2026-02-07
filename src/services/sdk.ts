@@ -16,9 +16,37 @@ export class CetusSDKService {
 
   constructor(config: BotConfig) {
     this.config = config;
+    
+    // Validate configuration before initializing
+    this.validateConfig(config);
+    
     this.keypair = this.initializeKeypair(config.privateKey);
     this.suiClient = this.initializeSuiClient(config);
     this.sdk = this.initializeSDK(config);
+  }
+
+  private validateConfig(config: BotConfig): void {
+    if (!config.privateKey || config.privateKey.trim() === '') {
+      throw new Error('PRIVATE_KEY is required but not set in .env file');
+    }
+
+    if (!config.poolAddress || config.poolAddress.trim() === '') {
+      throw new Error('POOL_ADDRESS is required but not set in .env file');
+    }
+
+    // Validate private key format (should be 64 hex characters or 66 with 0x prefix)
+    const cleanKey = config.privateKey.startsWith('0x') 
+      ? config.privateKey.slice(2) 
+      : config.privateKey;
+    
+    if (!/^[0-9a-fA-F]{64}$/.test(cleanKey)) {
+      throw new Error('PRIVATE_KEY must be exactly 64 hexadecimal characters (or 66 with 0x prefix)');
+    }
+
+    // Validate pool address format (should be a valid Sui address)
+    if (!config.poolAddress.startsWith('0x')) {
+      throw new Error('POOL_ADDRESS must start with 0x');
+    }
   }
 
   private initializeKeypair(privateKey: string): Ed25519Keypair {

@@ -37,8 +37,13 @@ export class CetusRebalanceBot {
       return;
     }
 
+    logger.info('Initializing Cetus Rebalance Bot...');
+
+    // Validate environment setup before starting
+    await this.validateSetup();
+
     this.isRunning = true;
-    logger.info('Starting Cetus Rebalance Bot...');
+    logger.info('Bot started successfully');
 
     // Perform initial check
     await this.performCheck();
@@ -48,7 +53,77 @@ export class CetusRebalanceBot {
       await this.performCheck();
     }, config.checkInterval * 1000);
 
-    logger.info(`Bot started - checking every ${config.checkInterval} seconds`);
+    logger.info(`Bot running - checking every ${config.checkInterval} seconds`);
+  }
+
+  private async validateSetup(): Promise<void> {
+    try {
+      logger.info('Validating bot setup...');
+
+      // Check wallet balance
+      const address = this.sdkService.getAddress();
+      logger.info(`Using wallet address: ${address}`);
+
+      const suiClient = this.sdkService.getSuiClient();
+      
+      // Get SUI balance
+      try {
+        const balance = await suiClient.getBalance({
+          owner: address,
+          coinType: '0x2::sui::SUI',
+        });
+        const suiBalance = parseFloat(balance.totalBalance) / 1_000_000_000; // Convert MIST to SUI
+        logger.info(`Wallet SUI balance: ${suiBalance.toFixed(4)} SUI`);
+        
+        if (suiBalance < 0.1) {
+          logger.warn(`Low SUI balance (${suiBalance.toFixed(4)} SUI). You may not have enough for gas fees.`);
+        }
+      } catch (error) {
+        logger.warn('Could not fetch wallet balance', error);
+      }
+
+      // Validate pool exists
+      logger.info(`Validating pool address: ${config.poolAddress}`);
+      try {
+        const poolInfo = await this.monitorService.getPoolInfo(config.poolAddress);
+        logger.info('Pool validation successful', {
+          poolAddress: poolInfo.poolAddress,
+          currentTick: poolInfo.currentTickIndex,
+          coinTypeA: poolInfo.coinTypeA,
+          coinTypeB: poolInfo.coinTypeB,
+        });
+      } catch (error) {
+        logger.error('Pool validation failed. Cannot start bot.');
+        throw new Error('Invalid pool configuration. Please check POOL_ADDRESS in .env file.');
+      }
+
+      // Check for existing positions
+      try {
+        const positions = await this.monitorService.getPositions(address);
+        const poolPositions = positions.filter(p => p.poolAddress === config.poolAddress);
+        
+        if (poolPositions.length > 0) {
+          logger.info(`Found ${poolPositions.length} existing position(s) in this pool`);
+          poolPositions.forEach((pos, idx) => {
+            logger.info(`Position ${idx + 1}:`, {
+              id: pos.positionId,
+              tickRange: `[${pos.tickLower}, ${pos.tickUpper}]`,
+              inRange: pos.inRange,
+            });
+          });
+        } else {
+          logger.info('No existing positions found in this pool');
+          logger.warn('The bot will attempt to create a new position when rebalancing is triggered');
+        }
+      } catch (error) {
+        logger.warn('Could not fetch existing positions', error);
+      }
+
+      logger.info('Setup validation completed successfully');
+    } catch (error) {
+      logger.error('Setup validation failed', error);
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
