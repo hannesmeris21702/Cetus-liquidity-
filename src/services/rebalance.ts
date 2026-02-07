@@ -95,6 +95,7 @@ export class RebalanceService {
         positionId: position.positionId,
         currentTick: poolInfo.currentTickIndex,
         oldRange: { lower: position.tickLower, upper: position.tickUpper },
+        liquidity: position.liquidity,
       });
 
       // Calculate optimal range
@@ -129,8 +130,22 @@ export class RebalanceService {
         };
       }
 
-      // Remove liquidity from old position
-      await this.removeLiquidity(position.positionId, position.liquidity);
+      // Check if position has liquidity before trying to remove
+      const hasLiquidity = position.liquidity && BigInt(position.liquidity) > 0n;
+      
+      if (hasLiquidity) {
+        // Try to remove liquidity from old position
+        try {
+          await this.removeLiquidity(position.positionId, position.liquidity);
+        } catch (removeError) {
+          logger.error('Failed to remove liquidity from old position', removeError);
+          // Log the error but continue to try adding liquidity to new position
+          // This handles the case where position already has no liquidity
+          logger.info('Continuing with adding liquidity to new position despite removal failure');
+        }
+      } else {
+        logger.info('Position has no liquidity - skipping removal step');
+      }
 
       // Create new position with new range
       const result = await this.addLiquidity(poolInfo, lower, upper);
@@ -380,25 +395,72 @@ export class RebalanceService {
       const positionId: string = positionObject.objectId as string;
       logger.info('Position NFT created', { positionId });
 
-      // Try to add liquidity to the position
-      // Note: In some SDK versions, opening a position and adding liquidity are combined
-      // or adding liquidity happens in a separate call
+      // Now add liquidity to the position
       try {
-        // Attempt to add liquidity if SDK supports it
-        // This may not be necessary if opening position already added liquidity
-        logger.info('Attempting to add initial liquidity...');
+        logger.info('Adding liquidity to position...');
         
-        // For now, we'll log that the position is created and return
-        // In production, you may need to add liquidity in a separate transaction
-        logger.info('Position created. You may need to add liquidity separately via the Cetus UI or another transaction.');
+        // Use the SDK's fix token method which automatically calculates liquidity
+        // This will fix amount A and automatically calculate the required amount B
+        const addLiquidityParams = {
+          pool_id: poolInfo.poolAddress,
+          pos_id: positionId,
+          tick_lower: tickLower,
+          tick_upper: tickUpper,
+          amount_a: amountA,
+          amount_b: amountB,
+          fix_amount_a: true, // Fix amount A, let SDK calculate amount B
+          is_open: false, // Position is already open
+          coinTypeA: poolInfo.coinTypeA,
+          coinTypeB: poolInfo.coinTypeB,
+          collect_fee: false,
+          rewarder_coin_types: [],
+        };
         
+        // Get current pool state for gas estimation if needed
+        const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+        const currentSqrtPrice = new BN(pool.current_sqrt_price);
+        
+        // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
+        const addLiquidityPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
+          addLiquidityParams as any,
+          {
+            slippage: this.config.maxSlippage,
+            curSqrtPrice: currentSqrtPrice,
+          }
+        );
+        
+        logger.info('Executing add liquidity transaction...');
+        const addResult = await suiClient.signAndExecuteTransaction({
+          transaction: addLiquidityPayload,
+          signer: keypair,
+          options: {
+            showEffects: true,
+            showEvents: true,
+          },
+        });
+        
+        if (addResult.effects?.status?.status !== 'success') {
+          throw new Error(`Failed to add liquidity: ${addResult.effects?.status?.error || 'Unknown error'}`);
+        }
+        
+        logger.info('Liquidity added successfully', {
+          digest: addResult.digest,
+          positionId,
+          amountA,
+          amountB,
+        });
+        
+        return {
+          transactionDigest: addResult.digest,
+        };
       } catch (addError) {
-        logger.warn('Could not add liquidity automatically. Position is open but empty.', addError);
+        logger.error('Failed to add liquidity to position', addError);
+        logger.warn('Position is open but has no liquidity. You may need to add liquidity manually.');
+        // Return the open position transaction digest even if adding liquidity failed
+        return {
+          transactionDigest: openResult.digest,
+        };
       }
-
-      return {
-        transactionDigest: openResult.digest,
-      };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
