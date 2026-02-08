@@ -120,8 +120,9 @@ export class PositionMonitorService {
     const currentTick = poolInfo.currentTickIndex;
     const { tickLower, tickUpper } = position;
 
-    // Check if position is out of range
-    if (!position.inRange) {
+    // Check if position is out of range using current pool tick
+    const isCurrentlyInRange = this.isPositionInRange(tickLower, tickUpper, currentTick);
+    if (!isCurrentlyInRange) {
       logger.info('Position is out of range - rebalance needed');
       return true;
     }

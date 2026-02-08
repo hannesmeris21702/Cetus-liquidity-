@@ -105,8 +105,45 @@ export class RebalanceService {
         return await this.createNewPosition(poolInfo);
       }
 
-      // For simplicity, rebalance the first position
-      const position = poolPositions[0];
+      // Find positions that actually need rebalancing
+      const positionsNeedingRebalance = poolPositions.filter(p => 
+        this.monitorService.shouldRebalance(p, poolInfo)
+      );
+
+      if (positionsNeedingRebalance.length === 0) {
+        logger.info('No position currently needs rebalancing');
+        return { success: true };
+      }
+
+      // Check if any position needing rebalance has liquidity to move
+      const hasLiquidityToMove = positionsNeedingRebalance.some(p => 
+        p.liquidity != null && BigInt(p.liquidity) > 0n
+      );
+
+      if (!hasLiquidityToMove) {
+        // All out-of-range positions are empty - check if in-range position already exists
+        const inRangePositions = poolPositions.filter(p => 
+          !this.monitorService.shouldRebalance(p, poolInfo)
+        );
+        
+        if (inRangePositions.length > 0) {
+          logger.info('Out-of-range positions have no liquidity and in-range position already exists - no action needed');
+          return { success: true };
+        }
+        
+        logger.info('No in-range position exists - will create new position with wallet funds');
+      }
+
+      // Prefer positions with liquidity for rebalancing
+      positionsNeedingRebalance.sort((a, b) => {
+        const liqA = BigInt(a.liquidity || '0');
+        const liqB = BigInt(b.liquidity || '0');
+        if (liqA > liqB) return -1;
+        if (liqA < liqB) return 1;
+        return 0;
+      });
+
+      const position = positionsNeedingRebalance[0];
       logger.info('Rebalancing existing position', {
         positionId: position.positionId,
         currentTick: poolInfo.currentTickIndex,
@@ -164,8 +201,21 @@ export class RebalanceService {
         logger.info('Position has no liquidity - skipping removal step');
       }
 
-      // Create new position with new range
-      const result = await this.addLiquidity(poolInfo, lower, upper);
+      // Check if an existing position already covers the optimal range
+      const existingInRangePosition = poolPositions.find(p =>
+        p.positionId !== position.positionId &&
+        p.tickLower === lower &&
+        p.tickUpper === upper
+      );
+
+      if (existingInRangePosition) {
+        logger.info('Found existing position at optimal range - adding liquidity to it', {
+          positionId: existingInRangePosition.positionId,
+        });
+      }
+
+      // Add liquidity to existing in-range position or create a new one
+      const result = await this.addLiquidity(poolInfo, lower, upper, existingInRangePosition?.positionId);
 
       logger.info('Rebalance completed successfully', {
         oldRange: { lower: position.tickLower, upper: position.tickUpper },
@@ -358,7 +408,8 @@ export class RebalanceService {
   private async addLiquidity(
     poolInfo: PoolInfo,
     tickLower: number,
-    tickUpper: number
+    tickUpper: number,
+    existingPositionId?: string
   ): Promise<{ transactionDigest?: string }> {
     try {
       logger.info('Adding liquidity', {
@@ -413,72 +464,88 @@ export class RebalanceService {
         throw error;
       }
 
-      logger.info('Opening new position with liquidity', {
-        amountA,
-        amountB,
-        tickLower,
-        tickUpper,
-      });
+      let positionId: string;
+      let openPositionDigest: string | undefined;
 
-      // Build open position transaction with type-safe parameters
-      const openParams: OpenPositionParams = {
-        pool_id: poolInfo.poolAddress,
-        tick_lower: tickLower.toString(),
-        tick_upper: tickUpper.toString(),
-        coinTypeA: poolInfo.coinTypeA,
-        coinTypeB: poolInfo.coinTypeB,
-      };
-      
-      // First, open the position with retry logic
-      logger.info('Opening position...');
-      const openResult = await this.retryTransaction(
-        async () => {
-          const openPositionPayload = await sdk.Position.openPositionTransactionPayload(openParams as any);
-          
-          const result = await suiClient.signAndExecuteTransaction({
-            transaction: openPositionPayload,
-            signer: keypair,
-            options: {
-              showEffects: true,
-              showEvents: true,
-              showObjectChanges: true,
-            },
-          });
+      if (existingPositionId) {
+        // Use existing position instead of creating a new one
+        positionId = existingPositionId;
+        logger.info('Adding liquidity to existing position', {
+          positionId,
+          amountA,
+          amountB,
+          tickLower,
+          tickUpper,
+        });
+      } else {
+        logger.info('Opening new position with liquidity', {
+          amountA,
+          amountB,
+          tickLower,
+          tickUpper,
+        });
 
-          if (result.effects?.status?.status !== 'success') {
-            throw new Error(`Failed to open position: ${result.effects?.status?.error || 'Unknown error'}`);
-          }
-
-          return result;
-        },
-        'open position',
-        3,
-        2000
-      );
-
-      logger.info('Position opened successfully', {
-        digest: openResult.digest,
-      });
-
-      // Extract the position NFT ID from the result
-      // Search for created position object in transaction changes
-      const createdObjects = (openResult.objectChanges?.filter((change: any) => change.type === 'created') || []) as any[];
-      const positionObject = createdObjects.find((obj: any) => 
-        obj.objectType && typeof obj.objectType === 'string' && obj.objectType.includes('Position')
-      );
-
-      if (!positionObject || !positionObject.objectId) {
-        // Position might be created but we couldn't extract the ID
-        // Log success but note that we couldn't track the position ID
-        logger.warn('Position created but could not extract position NFT ID from transaction result');
-        return {
-          transactionDigest: openResult.digest,
+        // Build open position transaction with type-safe parameters
+        const openParams: OpenPositionParams = {
+          pool_id: poolInfo.poolAddress,
+          tick_lower: tickLower.toString(),
+          tick_upper: tickUpper.toString(),
+          coinTypeA: poolInfo.coinTypeA,
+          coinTypeB: poolInfo.coinTypeB,
         };
-      }
+        
+        // First, open the position with retry logic
+        logger.info('Opening position...');
+        const openResult = await this.retryTransaction(
+          async () => {
+            const openPositionPayload = await sdk.Position.openPositionTransactionPayload(openParams as any);
+            
+            const result = await suiClient.signAndExecuteTransaction({
+              transaction: openPositionPayload,
+              signer: keypair,
+              options: {
+                showEffects: true,
+                showEvents: true,
+                showObjectChanges: true,
+              },
+            });
 
-      // Extract the position ID (validated above)
-      const positionId: string = positionObject.objectId as string;
-      logger.info('Position NFT created', { positionId });
+            if (result.effects?.status?.status !== 'success') {
+              throw new Error(`Failed to open position: ${result.effects?.status?.error || 'Unknown error'}`);
+            }
+
+            return result;
+          },
+          'open position',
+          3,
+          2000
+        );
+
+        logger.info('Position opened successfully', {
+          digest: openResult.digest,
+        });
+
+        // Extract the position NFT ID from the result
+        // Search for created position object in transaction changes
+        const createdObjects = (openResult.objectChanges?.filter((change: any) => change.type === 'created') || []) as any[];
+        const positionObject = createdObjects.find((obj: any) => 
+          obj.objectType && typeof obj.objectType === 'string' && obj.objectType.includes('Position')
+        );
+
+        if (!positionObject || !positionObject.objectId) {
+          // Position might be created but we couldn't extract the ID
+          // Log success but note that we couldn't track the position ID
+          logger.warn('Position created but could not extract position NFT ID from transaction result');
+          return {
+            transactionDigest: openResult.digest,
+          };
+        }
+
+        // Extract the position ID (validated above)
+        positionId = positionObject.objectId as string;
+        openPositionDigest = openResult.digest;
+        logger.info('Position NFT created', { positionId });
+      }
 
       // Now add liquidity to the position
       try {
@@ -552,9 +619,8 @@ export class RebalanceService {
       } catch (addError) {
         logger.error('Failed to add liquidity to position', addError);
         logger.warn('Position is open but has no liquidity. You may need to add liquidity manually.');
-        // Return the open position transaction digest even if adding liquidity failed
         return {
-          transactionDigest: openResult.digest,
+          transactionDigest: openPositionDigest,
         };
       }
     } catch (error) {
