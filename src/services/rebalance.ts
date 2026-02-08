@@ -143,13 +143,11 @@ export class RebalanceService {
         liquidity: position.liquidity,
       });
 
-      // Calculate optimal range, preserving the old position's range width
-      // so that the new position uses the same parameters.
-      const oldRangeWidth = position.tickUpper - position.tickLower;
+      // Calculate the tightest active range (single tick-spacing bin) centred
+      // on the current tick.  This maximises capital efficiency and fee capture.
       const { lower, upper } = this.monitorService.calculateOptimalRange(
         poolInfo.currentTickIndex,
         poolInfo.tickSpacing,
-        oldRangeWidth
       );
 
       // If range hasn't changed significantly, skip rebalance
@@ -362,7 +360,7 @@ export class RebalanceService {
           return txResult;
         },
         'remove liquidity',
-        3,
+        2,
         2000
       );
 
@@ -768,7 +766,7 @@ export class RebalanceService {
           return result;
         },
         'add liquidity',
-        3,
+        2,
         2000
       );
       

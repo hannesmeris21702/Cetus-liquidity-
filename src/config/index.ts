@@ -72,7 +72,7 @@ export function loadConfig(): BotConfig {
     tokenAAmount: getEnvVar('TOKEN_A_AMOUNT', false) || undefined,
     tokenBAmount: getEnvVar('TOKEN_B_AMOUNT', false) || undefined,
     maxSlippage: getEnvNumber('MAX_SLIPPAGE', 0.01),
-    gasBudget: getEnvNumber('GAS_BUDGET', 100000000),
+    gasBudget: getEnvNumber('GAS_BUDGET', 50000000),
     logLevel: (getEnvVar('LOG_LEVEL', false) || 'info') as 'debug' | 'info' | 'warn' | 'error',
     verboseLogs: getEnvBoolean('VERBOSE_LOGS', false),
   };
