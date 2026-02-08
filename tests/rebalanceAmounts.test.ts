@@ -44,8 +44,8 @@ function computeRebalanceAmounts(
   const removedA = removedAmountA ? BigInt(removedAmountA) : 0n;
   const removedB = removedAmountB ? BigInt(removedAmountB) : 0n;
 
-  const amountA = (removedA > 0n && removedA <= safeBalanceA ? removedA : safeBalanceA).toString();
-  const amountB = (removedB > 0n && removedB <= safeBalanceB ? removedB : safeBalanceB).toString();
+  const amountA = (removedA > 0n ? (removedA <= safeBalanceA ? removedA : safeBalanceA) : 0n).toString();
+  const amountB = (removedB > 0n ? (removedB <= safeBalanceB ? removedB : safeBalanceB) : 0n).toString();
 
   return { amountA, amountB };
 }
@@ -61,20 +61,20 @@ function computeRebalanceAmounts(
 }
 
 // 2. One removed amount is undefined (out-of-range, all in token B).
-//    Token A should fall back to wallet balance.
+//    Token A should stay 0 so only freed liquidity is re-added.
 {
   const { amountA, amountB } = computeRebalanceAmounts(undefined, '5000', '1200', '6000');
-  assert.strictEqual(amountA, '1200', 'should fall back to wallet balance for token A');
+  assert.strictEqual(amountA, '0', 'should stay 0 when nothing was removed for token A');
   assert.strictEqual(amountB, '5000', 'should use removed amount for token B');
-  console.log('✔ undefined removed amount A falls back to wallet balance');
+  console.log('✔ undefined removed amount A stays 0 (swap logic will balance)');
 }
 
 // 3. One removed amount is undefined (out-of-range, all in token A).
 {
   const { amountA, amountB } = computeRebalanceAmounts('7000', undefined, '8000', '3000');
   assert.strictEqual(amountA, '7000');
-  assert.strictEqual(amountB, '3000', 'should fall back to wallet balance for token B');
-  console.log('✔ undefined removed amount B falls back to wallet balance');
+  assert.strictEqual(amountB, '0', 'should stay 0 when nothing was removed for token B');
+  console.log('✔ undefined removed amount B stays 0 (swap logic will balance)');
 }
 
 // 4. Removed amount exceeds wallet balance (e.g. gas consumed SUI).
@@ -86,54 +86,52 @@ function computeRebalanceAmounts(
   console.log('✔ removed amount capped at wallet balance');
 }
 
-// 5. Both removed amounts undefined – both fall back to wallet balance.
+// 5. Both removed amounts undefined – both stay 0 (no liquidity was freed).
 {
   const { amountA, amountB } = computeRebalanceAmounts(undefined, undefined, '400', '600');
-  assert.strictEqual(amountA, '400');
-  assert.strictEqual(amountB, '600');
-  console.log('✔ both undefined → wallet balance used for both');
+  assert.strictEqual(amountA, '0');
+  assert.strictEqual(amountB, '0');
+  console.log('✔ both undefined → 0 for both (no freed liquidity to re-add)');
 }
 
-// 6. Wallet balance is 0 for one token after gas costs – amount stays 0.
+// 6. Wallet balance is 0 for one token after gas costs – removed stays 0.
 {
   const { amountA, amountB } = computeRebalanceAmounts(undefined, '2000', '0', '3000');
-  assert.strictEqual(amountA, '0', 'wallet balance 0 means amount 0');
+  assert.strictEqual(amountA, '0', 'no removed amount → stays 0');
   assert.strictEqual(amountB, '2000');
-  console.log('✔ wallet balance 0 produces amount 0 (SDK may still fail gracefully)');
+  console.log('✔ wallet balance 0 and no removed amount → 0');
 }
 
-// 7. OLD BUG SCENARIO: removed amount A is undefined, code used to pass '0'.
-//    With wallet having non-zero A balance, now it should pass the wallet balance.
+// 7. KEY FIX SCENARIO: removed amount A is undefined, wallet has non-zero A.
+//    Old code fell back to full wallet balance → new position got extra liquidity.
+//    Fixed code keeps 0 so only freed amounts are re-added.
 {
   const { amountA, amountB } = computeRebalanceAmounts(undefined, '10000', '5000', '10000');
-  assert.notStrictEqual(amountA, '0', 'MUST NOT pass 0 when wallet has token A');
-  assert.strictEqual(amountA, '5000', 'should use wallet balance as max for token A');
-  console.log('✔ old bug scenario: non-zero wallet balance used instead of 0');
+  assert.strictEqual(amountA, '0', 'MUST be 0 — only freed liquidity should be re-added');
+  assert.strictEqual(amountB, '10000');
+  console.log('✔ key fix: no extra wallet funds used when removed amount is 0');
 }
 
-// 8. SUI gas reserve: token A is SUI – wallet balance fallback should be
-//    reduced by gas budget to avoid balance::split error.
+// 8. SUI gas reserve: token A is SUI, removed amount undefined → stays 0.
 {
-  // Wallet has 4_200_000_000 MIST (4.2 SUI), gas budget = 100_000_000 (0.1 SUI)
-  // Safe balance = 4_200_000_000 - 100_000_000 = 4_100_000_000
   const { amountA, amountB } = computeRebalanceAmounts(
     undefined, '5000000000', '4200000000', '6000000000',
     true, false, 100_000_000n,
   );
-  assert.strictEqual(amountA, '4100000000', 'SUI balance should be reduced by gas reserve');
+  assert.strictEqual(amountA, '0', 'no removed A → stays 0 regardless of wallet balance');
   assert.strictEqual(amountB, '5000000000', 'non-SUI token unaffected');
-  console.log('✔ SUI gas reserve applied when token A is SUI');
+  console.log('✔ SUI token A with no removed amount stays 0');
 }
 
-// 9. SUI gas reserve: token B is SUI – same logic applies to token B.
+// 9. SUI gas reserve: token B is SUI, removed amount undefined → stays 0.
 {
   const { amountA, amountB } = computeRebalanceAmounts(
     '3000000000', undefined, '5000000000', '2000000000',
     false, true, 100_000_000n,
   );
   assert.strictEqual(amountA, '3000000000');
-  assert.strictEqual(amountB, '1900000000', 'SUI balance should be reduced by gas reserve');
-  console.log('✔ SUI gas reserve applied when token B is SUI');
+  assert.strictEqual(amountB, '0', 'no removed B → stays 0 regardless of wallet balance');
+  console.log('✔ SUI token B with no removed amount stays 0');
 }
 
 // 10. SUI gas reserve: removed SUI amount exceeds safe balance → cap to safe balance.
@@ -148,26 +146,50 @@ function computeRebalanceAmounts(
   console.log('✔ SUI removed amount capped at safe balance');
 }
 
-// 11. SUI gas reserve: wallet balance ≤ gas budget – safe balance stays 0 (no underflow).
+// 11. SUI gas reserve: wallet balance ≤ gas budget, no removed amount → stays 0.
 {
   const { amountA, amountB } = computeRebalanceAmounts(
     undefined, '1000', '50000000', '2000',
     true, false, 100_000_000n,
   );
-  // 50_000_000 ≤ 100_000_000 → condition false, safeBalanceA = 50_000_000
-  assert.strictEqual(amountA, '50000000', 'no underflow when balance <= gas budget');
+  assert.strictEqual(amountA, '0', 'no removed A → stays 0');
   assert.strictEqual(amountB, '1000');
-  console.log('✔ no underflow when SUI balance is below gas budget');
+  console.log('✔ no removed amount stays 0 even with low SUI balance');
 }
 
-// 12. Non-SUI tokens: gas reserve should not affect non-SUI tokens.
+// 12. Non-SUI tokens: no removed amount → stays 0.
 {
   const { amountA, amountB } = computeRebalanceAmounts(
     undefined, '1000', '500000000', '2000',
     false, false, 100_000_000n,
   );
-  assert.strictEqual(amountA, '500000000', 'non-SUI not affected by gas reserve');
-  console.log('✔ non-SUI tokens unaffected by gas reserve');
+  assert.strictEqual(amountA, '0', 'no removed A → stays 0');
+  console.log('✔ non-SUI tokens: no removed amount stays 0');
+}
+
+// 13. Same-liquidity guarantee: when both removed amounts are provided,
+//     the new position uses exactly those amounts (not more from wallet).
+{
+  // Old position freed 2000 A and 3000 B, wallet has much larger balances
+  const { amountA, amountB } = computeRebalanceAmounts(
+    '2000', '3000', '1000000', '2000000',
+  );
+  assert.strictEqual(amountA, '2000', 'must re-add exactly what was removed for A');
+  assert.strictEqual(amountB, '3000', 'must re-add exactly what was removed for B');
+  console.log('✔ same-liquidity: re-adds exactly the freed amounts, not full wallet');
+}
+
+// 14. SUI gas reserve: removed SUI amount within safe balance → use exact removed amount.
+{
+  // Removed 3.0 SUI, wallet has 4.2 SUI, gas reserve = 0.1 SUI → safe = 4.1 SUI
+  // 3.0 < 4.1, so use 3.0
+  const { amountA, amountB } = computeRebalanceAmounts(
+    '3000000000', '5000000000', '4200000000', '6000000000',
+    true, false, 100_000_000n,
+  );
+  assert.strictEqual(amountA, '3000000000', 'use exact removed SUI when within safe balance');
+  assert.strictEqual(amountB, '5000000000');
+  console.log('✔ SUI removed amount used exactly when within safe balance');
 }
 
 console.log('\nAll rebalanceAmounts tests passed ✅');

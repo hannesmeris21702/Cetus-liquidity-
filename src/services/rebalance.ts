@@ -581,17 +581,16 @@ export class RebalanceService {
       let amountB: string;
       
       if (removedAmountA || removedAmountB) {
-        // Rebalancing: use the token amounts freed from the old position.
-        // For out-of-range positions, one token's freed amount may be 0/undefined.
-        // Fall back to the safe wallet balance (minus gas reserve for SUI) so
-        // the SDK can pull the required counterpart amount when adding to an
-        // in-range position.
+        // Rebalancing: use exactly the token amounts freed from the old position
+        // so the new position carries the same liquidity value.
+        // For out-of-range positions one token may be 0 — keep it as 0 and let
+        // the swap logic below convert half of the non-zero token.
         // Cap at safe balance to handle gas-cost deductions (e.g. when one of
         // the tokens is SUI, removal gas reduces the balance delta).
         const removedA = removedAmountA ? BigInt(removedAmountA) : 0n;
         const removedB = removedAmountB ? BigInt(removedAmountB) : 0n;
-        amountA = (removedA > 0n && removedA <= safeBalanceA ? removedA : safeBalanceA).toString();
-        amountB = (removedB > 0n && removedB <= safeBalanceB ? removedB : safeBalanceB).toString();
+        amountA = (removedA > 0n ? (removedA <= safeBalanceA ? removedA : safeBalanceA) : 0n).toString();
+        amountB = (removedB > 0n ? (removedB <= safeBalanceB ? removedB : safeBalanceB) : 0n).toString();
         logger.info('Using removed position amounts for rebalance', { amountA, amountB });
       } else {
         amountA = this.config.tokenAAmount || String(safeBalanceA > 0n ? safeBalanceA / 10n : defaultMinAmount);
