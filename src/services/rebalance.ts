@@ -46,6 +46,7 @@ interface AddLiquidityFixTokenParams {
   tick_upper: number;
   amount_a: string;
   amount_b: string;
+  slippage: number;
   fix_amount_a: boolean;
   is_open: boolean;
   coinTypeA: string;
@@ -492,6 +493,7 @@ export class RebalanceService {
           tick_upper: tickUpper,
           amount_a: amountA,
           amount_b: amountB,
+          slippage: this.config.maxSlippage,
           fix_amount_a: true, // Fix amount A, let SDK calculate amount B
           is_open: false, // Position is already open
           coinTypeA: poolInfo.coinTypeA,
