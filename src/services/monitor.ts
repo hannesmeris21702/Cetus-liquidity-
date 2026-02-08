@@ -151,16 +151,24 @@ export class PositionMonitorService {
   }
 
   calculateOptimalRange(currentTick: number, tickSpacing: number): { lower: number; upper: number } {
-    // If range width is specified, use it
-    const rangeWidth = this.config.rangeWidth || tickSpacing * 10;
-    
-    // Center the range around current tick
-    const ticksBelow = Math.floor(rangeWidth / 2);
-    const ticksAbove = Math.ceil(rangeWidth / 2);
+    if (this.config.rangeWidth) {
+      // When an explicit range width is configured, center it around current tick
+      const rangeWidth = this.config.rangeWidth;
+      const ticksBelow = Math.floor(rangeWidth / 2);
+      const ticksAbove = Math.ceil(rangeWidth / 2);
 
-    // Align to tick spacing
-    const lower = Math.floor((currentTick - ticksBelow) / tickSpacing) * tickSpacing;
-    const upper = Math.ceil((currentTick + ticksAbove) / tickSpacing) * tickSpacing;
+      // Align to tick spacing
+      const lower = Math.floor((currentTick - ticksBelow) / tickSpacing) * tickSpacing;
+      const upper = Math.ceil((currentTick + ticksAbove) / tickSpacing) * tickSpacing;
+
+      return { lower, upper };
+    }
+
+    // Default: tightest active range — the single tick-spacing bin that
+    // contains the current tick.  This maximises capital efficiency and fee
+    // capture per unit of liquidity.
+    const lower = Math.floor(currentTick / tickSpacing) * tickSpacing;
+    const upper = lower + tickSpacing;
 
     return { lower, upper };
   }
