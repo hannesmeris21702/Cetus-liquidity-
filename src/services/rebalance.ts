@@ -187,10 +187,51 @@ export class RebalanceService {
       // Explicitly handle null/undefined and check for non-zero liquidity
       const hasLiquidity = position.liquidity != null && BigInt(position.liquidity) > 0n;
       
+      // Track token amounts freed by removing liquidity so we can re-add the same amount
+      let removedAmountA: string | undefined;
+      let removedAmountB: string | undefined;
+
       if (hasLiquidity) {
         // Try to remove liquidity from old position
         try {
+          // Capture wallet balances before removal
+          const suiClient = this.sdkService.getSuiClient();
+          const ownerAddress = this.sdkService.getAddress();
+          const balanceBeforeA = await suiClient.getBalance({
+            owner: ownerAddress,
+            coinType: poolInfo.coinTypeA,
+          });
+          const balanceBeforeB = await suiClient.getBalance({
+            owner: ownerAddress,
+            coinType: poolInfo.coinTypeB,
+          });
+
           await this.removeLiquidity(position.positionId, position.liquidity);
+
+          // Capture wallet balances after removal to determine freed amounts
+          const balanceAfterA = await suiClient.getBalance({
+            owner: ownerAddress,
+            coinType: poolInfo.coinTypeA,
+          });
+          const balanceAfterB = await suiClient.getBalance({
+            owner: ownerAddress,
+            coinType: poolInfo.coinTypeB,
+          });
+
+          // Compute freed token amounts from wallet balance delta.
+          // Note: This approach assumes no concurrent transactions modify the wallet
+          // during the removal. For a single-wallet bot this is reliable. The Cetus SDK
+          // remove liquidity transaction does not directly expose returned token amounts.
+          const deltaA = BigInt(balanceAfterA.totalBalance) - BigInt(balanceBeforeA.totalBalance);
+          const deltaB = BigInt(balanceAfterB.totalBalance) - BigInt(balanceBeforeB.totalBalance);
+          // An out-of-range position may have all value in one token, so one delta may be 0
+          removedAmountA = deltaA > 0n ? deltaA.toString() : undefined;
+          removedAmountB = deltaB > 0n ? deltaB.toString() : undefined;
+
+          logger.info('Token amounts freed from removed position', {
+            removedAmountA: removedAmountA || '0',
+            removedAmountB: removedAmountB || '0',
+          });
         } catch (removeError) {
           logger.error('Failed to remove liquidity from old position', removeError);
           // Log the error but continue to try adding liquidity to new position
@@ -215,7 +256,8 @@ export class RebalanceService {
       }
 
       // Add liquidity to existing in-range position or create a new one
-      const result = await this.addLiquidity(poolInfo, lower, upper, existingInRangePosition?.positionId);
+      // Pass the removed token amounts so the same liquidity is re-added
+      const result = await this.addLiquidity(poolInfo, lower, upper, existingInRangePosition?.positionId, removedAmountA, removedAmountB);
 
       logger.info('Rebalance completed successfully', {
         oldRange: { lower: position.tickLower, upper: position.tickUpper },
@@ -409,7 +451,9 @@ export class RebalanceService {
     poolInfo: PoolInfo,
     tickLower: number,
     tickUpper: number,
-    existingPositionId?: string
+    existingPositionId?: string,
+    removedAmountA?: string,
+    removedAmountB?: string
   ): Promise<{ transactionDigest?: string }> {
     try {
       logger.info('Adding liquidity', {
@@ -440,22 +484,40 @@ export class RebalanceService {
         coinTypeB: poolInfo.coinTypeB,
       });
 
-      // Use configured amounts or default to a portion of available balance
+      // Use removed amounts (from rebalance) if available, otherwise fall back to
+      // configured amounts or a portion of available balance
       // Use BigInt arithmetic to avoid precision loss with large numbers
       const balanceABigInt = BigInt(balanceA.totalBalance);
       const balanceBBigInt = BigInt(balanceB.totalBalance);
       const defaultMinAmount = 1000n;
       
-      const amountA = this.config.tokenAAmount || String(balanceABigInt > 0n ? balanceABigInt / 10n : defaultMinAmount);
-      const amountB = this.config.tokenBAmount || String(balanceBBigInt > 0n ? balanceBBigInt / 10n : defaultMinAmount);
+      let amountA: string;
+      let amountB: string;
+      
+      if (removedAmountA || removedAmountB) {
+        // Rebalancing: use the same token amounts that were freed from the old position
+        amountA = removedAmountA || '0';
+        amountB = removedAmountB || '0';
+        logger.info('Using removed position amounts for rebalance', { amountA, amountB });
+      } else {
+        amountA = this.config.tokenAAmount || String(balanceABigInt > 0n ? balanceABigInt / 10n : defaultMinAmount);
+        amountB = this.config.tokenBAmount || String(balanceBBigInt > 0n ? balanceBBigInt / 10n : defaultMinAmount);
+      }
 
       // Validate amounts
       try {
         const amountABigInt = BigInt(amountA);
         const amountBBigInt = BigInt(amountB);
         
-        if (amountABigInt === 0n || amountBBigInt === 0n) {
-          throw new Error('Insufficient token balance to add liquidity. Please ensure you have both tokens in your wallet.');
+        if (removedAmountA || removedAmountB) {
+          // During rebalance, an out-of-range position may have all value in one token
+          if (amountABigInt === 0n && amountBBigInt === 0n) {
+            throw new Error('No tokens were freed from the removed position.');
+          }
+        } else {
+          if (amountABigInt === 0n || amountBBigInt === 0n) {
+            throw new Error('Insufficient token balance to add liquidity. Please ensure you have both tokens in your wallet.');
+          }
         }
       } catch (error) {
         if (error instanceof Error && error.message.includes('Cannot convert')) {
@@ -463,6 +525,11 @@ export class RebalanceService {
         }
         throw error;
       }
+
+      // Determine which token to fix based on available amounts.
+      // When one amount is 0 (common for out-of-range positions), this ensures
+      // we fix the non-zero token so the SDK can compute the required counterpart.
+      const fixAmountA = BigInt(amountA) >= BigInt(amountB);
 
       let positionId: string;
       let openPositionDigest: string | undefined;
@@ -552,7 +619,7 @@ export class RebalanceService {
         logger.info('Adding liquidity to position...');
         
         // Use the SDK's fix token method which automatically calculates liquidity
-        // This will fix amount A and automatically calculate the required amount B
+        // Fix the token with the larger amount to maximize liquidity added
         const addLiquidityParams: AddLiquidityFixTokenParams = {
           pool_id: poolInfo.poolAddress,
           pos_id: positionId,
@@ -561,7 +628,7 @@ export class RebalanceService {
           amount_a: amountA,
           amount_b: amountB,
           slippage: this.config.maxSlippage,
-          fix_amount_a: true, // Fix amount A, let SDK calculate amount B
+          fix_amount_a: fixAmountA,
           is_open: false, // Position is already open
           coinTypeA: poolInfo.coinTypeA,
           coinTypeB: poolInfo.coinTypeB,
