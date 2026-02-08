@@ -458,12 +458,46 @@ export class RebalanceService {
       pool: poolInfo.poolAddress,
     });
 
+    // Compute a minimum output using preswap to protect against slippage.
+    // If the estimate fails we fall back to accepting any output.
+    let amountLimit = '0';
+    try {
+      const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+      const [metaA, metaB] = await Promise.all([
+        suiClient.getCoinMetadata({ coinType: poolInfo.coinTypeA }),
+        suiClient.getCoinMetadata({ coinType: poolInfo.coinTypeB }),
+      ]);
+      const preswapResult = await sdk.Swap.preswap({
+        pool,
+        currentSqrtPrice: Number(pool.current_sqrt_price),
+        decimalsA: metaA?.decimals ?? 9,
+        decimalsB: metaB?.decimals ?? 9,
+        a2b: aToB,
+        byAmountIn: true,
+        amount,
+        coinTypeA: poolInfo.coinTypeA,
+        coinTypeB: poolInfo.coinTypeB,
+      });
+      if (preswapResult && preswapResult.estimatedAmountOut) {
+        const estimated = BigInt(preswapResult.estimatedAmountOut);
+        const slippageBps = BigInt(Math.floor(this.config.maxSlippage * 10000));
+        const minOutput = estimated - (estimated * slippageBps) / 10000n;
+        amountLimit = (minOutput > 0n ? minOutput : 0n).toString();
+        logger.info('Swap slippage limit calculated', {
+          estimatedOut: estimated.toString(),
+          amountLimit,
+        });
+      }
+    } catch (e) {
+      logger.debug('Could not estimate swap output - proceeding without slippage limit');
+    }
+
     const swapPayload = await sdk.Swap.createSwapTransactionPayload({
       pool_id: poolInfo.poolAddress,
       a2b: aToB,
       by_amount_in: true,
       amount,
-      amount_limit: '0',
+      amount_limit: amountLimit,
       coinTypeA: poolInfo.coinTypeA,
       coinTypeB: poolInfo.coinTypeB,
     });
@@ -614,9 +648,9 @@ export class RebalanceService {
 
               logger.info('Balances after swap', { amountA, amountB });
             } catch (swapError) {
+              const swapMsg = swapError instanceof Error ? swapError.message : String(swapError);
               logger.warn(
-                'Swap failed - will attempt add liquidity with available amounts',
-                swapError,
+                `Swap failed (${swapMsg}) - will attempt add liquidity with available amounts`,
               );
             }
           }
@@ -635,7 +669,8 @@ export class RebalanceService {
             throw new Error('No tokens available for rebalancing. Wallet has insufficient balance of both tokens.');
           }
           if (amountABigInt === 0n || amountBBigInt === 0n) {
-            logger.warn('One token still has zero balance after swap attempt. Adding liquidity may fail.');
+            logger.warn('One token still has zero balance after swap attempt. ' +
+              'The add liquidity transaction will likely fail. Consider manually providing both tokens.');
           }
         } else {
           if (amountABigInt === 0n || amountBBigInt === 0n) {
