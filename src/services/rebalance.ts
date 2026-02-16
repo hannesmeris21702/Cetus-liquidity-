@@ -953,62 +953,18 @@ export class RebalanceService {
       logger.info('Executing add liquidity transaction...');
       
       let recoveryAttempted = false;
-      const addResult = await this.retryAddLiquidity(
-        async () => {
-          // Refetch pool state on each retry to get latest version
-          const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
-          const currentSqrtPrice = new BN(pool.current_sqrt_price);
-          
-          try {
-            // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
-            const addLiquidityPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
-              addLiquidityParams as any,
-              {
-                slippage: this.config.maxSlippage,
-                curSqrtPrice: currentSqrtPrice,
-              }
-            );
+      let addResult;
+      
+      try {
+        addResult = await this.retryAddLiquidity(
+          async () => {
+            // Refetch pool state on each retry to get latest version
+            const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+            const currentSqrtPrice = new BN(pool.current_sqrt_price);
             
-            const result = await suiClient.signAndExecuteTransaction({
-              transaction: addLiquidityPayload,
-              signer: keypair,
-              options: {
-                showEffects: true,
-                showEvents: true,
-              },
-            });
-            
-            if (result.effects?.status?.status !== 'success') {
-              throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
-            }
-            
-            return result;
-          } catch (txError) {
-            const errorMsg = txError instanceof Error ? txError.message : String(txError);
-            
-            // Check if this is an insufficient balance error and we haven't attempted recovery yet
-            if (!recoveryAttempted && this.isInsufficientBalanceError(errorMsg)) {
-              recoveryAttempted = true;
-              logger.info('Insufficient balance detected, attempting swap recovery...');
-              
-              // Attempt swap recovery
-              await this.attemptSwapRecovery(
-                poolInfo,
-                errorMsg,
-                amountA,
-                amountB,
-                ownerAddress,
-                suiClient
-              );
-              
-              // After swap, retry the add liquidity operation once
-              logger.info('Retrying add liquidity after swap recovery...');
-              
-              // Re-fetch pool state after swap
-              const poolAfterSwap = await sdk.Pool.getPool(poolInfo.poolAddress);
-              const currentSqrtPrice = new BN(poolAfterSwap.current_sqrt_price);
-              
-              const retryPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
+            try {
+              // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
+              const addLiquidityPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
                 addLiquidityParams as any,
                 {
                   slippage: this.config.maxSlippage,
@@ -1016,8 +972,8 @@ export class RebalanceService {
                 }
               );
               
-              const retryResult = await suiClient.signAndExecuteTransaction({
-                transaction: retryPayload,
+              const result = await suiClient.signAndExecuteTransaction({
+                transaction: addLiquidityPayload,
                 signer: keypair,
                 options: {
                   showEffects: true,
@@ -1025,20 +981,211 @@ export class RebalanceService {
                 },
               });
               
-              if (retryResult.effects?.status?.status !== 'success') {
-                throw new Error(`Failed to add liquidity after recovery: ${retryResult.effects?.status?.error || 'Unknown error'}`);
+              if (result.effects?.status?.status !== 'success') {
+                throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
               }
               
-              return retryResult;
+              return result;
+            } catch (txError) {
+              const errorMsg = txError instanceof Error ? txError.message : String(txError);
+              
+              // Check if this is an insufficient balance error and we haven't attempted recovery yet
+              if (!recoveryAttempted && this.isInsufficientBalanceError(errorMsg)) {
+                recoveryAttempted = true;
+                logger.info('Insufficient balance detected, attempting swap recovery...');
+                
+                // Attempt swap recovery
+                await this.attemptSwapRecovery(
+                  poolInfo,
+                  errorMsg,
+                  amountA,
+                  amountB,
+                  ownerAddress,
+                  suiClient
+                );
+                
+                // After swap, retry the add liquidity operation once
+                logger.info('Retrying add liquidity after swap recovery...');
+                
+                // Re-fetch pool state after swap
+                const poolAfterSwap = await sdk.Pool.getPool(poolInfo.poolAddress);
+                const currentSqrtPrice = new BN(poolAfterSwap.current_sqrt_price);
+                
+                const retryPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
+                  addLiquidityParams as any,
+                  {
+                    slippage: this.config.maxSlippage,
+                    curSqrtPrice: currentSqrtPrice,
+                  }
+                );
+                
+                const retryResult = await suiClient.signAndExecuteTransaction({
+                  transaction: retryPayload,
+                  signer: keypair,
+                  options: {
+                    showEffects: true,
+                    showEvents: true,
+                  },
+                });
+                
+                if (retryResult.effects?.status?.status !== 'success') {
+                  throw new Error(`Failed to add liquidity after recovery: ${retryResult.effects?.status?.error || 'Unknown error'}`);
+                }
+                
+                return retryResult;
+              }
+              
+              // If not an insufficient balance error or recovery already attempted, re-throw
+              throw txError;
             }
+          },
+          3,
+          3000
+        );
+      } catch (retryError) {
+        // Add liquidity failed after all retry attempts
+        // Implement fallback: open new position and retry once
+        const originalError = retryError;
+        
+        // Only attempt fallback if we were opening a new position initially
+        // If we were adding to an existing position, the fallback is to create a completely new position
+        if (isOpen) {
+          // Already tried to open a new position and it failed - throw original error
+          throw originalError;
+        }
+        
+        logger.warn('Add liquidity failed after retries, opening new position');
+        
+        try {
+          // Step 1: Calculate required amounts for new position
+          // Use the same amounts that were just attempted
+          const requiredA = BigInt(amountA);
+          const requiredB = BigInt(amountB);
+          
+          // Step 2: Check wallet balances
+          const [currentBalanceA, currentBalanceB] = await Promise.all([
+            suiClient.getBalance({
+              owner: ownerAddress,
+              coinType: poolInfo.coinTypeA,
+            }),
+            suiClient.getBalance({
+              owner: ownerAddress,
+              coinType: poolInfo.coinTypeB,
+            }),
+          ]);
+          
+          const walletBalanceA = BigInt(currentBalanceA.totalBalance);
+          const walletBalanceB = BigInt(currentBalanceB.totalBalance);
+          
+          // Apply gas reserve if needed
+          const SUI_GAS_RESERVE = BigInt(this.config.gasBudget);
+          const SUI_TYPE = '0x2::sui::SUI';
+          const SUI_TYPE_FULL = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
+          const isSuiCoinType = (ct: string) => ct === SUI_TYPE || ct === SUI_TYPE_FULL;
+          const isSuiA = isSuiCoinType(poolInfo.coinTypeA);
+          const isSuiB = isSuiCoinType(poolInfo.coinTypeB);
+          const safeBalanceA = isSuiA && walletBalanceA > SUI_GAS_RESERVE
+            ? walletBalanceA - SUI_GAS_RESERVE
+            : walletBalanceA;
+          const safeBalanceB = isSuiB && walletBalanceB > SUI_GAS_RESERVE
+            ? walletBalanceB - SUI_GAS_RESERVE
+            : walletBalanceB;
+          
+          // Step 3: Check if balances are insufficient
+          const isTokenAInsufficient = safeBalanceA < requiredA;
+          const isTokenBInsufficient = safeBalanceB < requiredB;
+          
+          // Step 4: If insufficient, swap only the missing amount
+          if (isTokenAInsufficient || isTokenBInsufficient) {
+            logger.info('Insufficient balance for new position, swapping required amount');
             
-            // If not an insufficient balance error or recovery already attempted, re-throw
-            throw txError;
+            if (isTokenAInsufficient) {
+              const missingAmountA = requiredA - safeBalanceA;
+              const swapAmount = this.calculateSwapAmountWithBuffer(missingAmountA);
+              
+              if (safeBalanceB >= swapAmount) {
+                logger.info(`Swapping Token B → Token A for missing amount`, { 
+                  missing: missingAmountA.toString(),
+                  swapAmount: swapAmount.toString()
+                });
+                await this.performSwap(poolInfo, false, swapAmount.toString());
+              } else {
+                throw new Error(`Insufficient Token B balance to swap for missing Token A. Need ${swapAmount.toString()}, have ${safeBalanceB.toString()}`);
+              }
+            } else if (isTokenBInsufficient) {
+              const missingAmountB = requiredB - safeBalanceB;
+              const swapAmount = this.calculateSwapAmountWithBuffer(missingAmountB);
+              
+              if (safeBalanceA >= swapAmount) {
+                logger.info(`Swapping Token A → Token B for missing amount`, { 
+                  missing: missingAmountB.toString(),
+                  swapAmount: swapAmount.toString()
+                });
+                await this.performSwap(poolInfo, true, swapAmount.toString());
+              } else {
+                throw new Error(`Insufficient Token A balance to swap for missing Token B. Need ${swapAmount.toString()}, have ${safeBalanceA.toString()}`);
+              }
+            }
           }
-        },
-        3,
-        3000
-      );
+          
+          // Step 5: Open new position and retry add liquidity once
+          logger.info('Retrying add liquidity on new position');
+          
+          const newPositionParams: AddLiquidityFixTokenParams = {
+            pool_id: poolInfo.poolAddress,
+            pos_id: '', // Empty for new position
+            tick_lower: tickLower,
+            tick_upper: tickUpper,
+            amount_a: amountA,
+            amount_b: amountB,
+            slippage: this.config.maxSlippage,
+            fix_amount_a: fixAmountA,
+            is_open: true, // Open new position
+            coinTypeA: poolInfo.coinTypeA,
+            coinTypeB: poolInfo.coinTypeB,
+            collect_fee: false,
+            rewarder_coin_types: [],
+          };
+          
+          // Get fresh pool state
+          const freshPool = await sdk.Pool.getPool(poolInfo.poolAddress);
+          const freshSqrtPrice = new BN(freshPool.current_sqrt_price);
+          
+          const newPositionPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
+            newPositionParams as any,
+            {
+              slippage: this.config.maxSlippage,
+              curSqrtPrice: freshSqrtPrice,
+            }
+          );
+          
+          const newPositionResult = await suiClient.signAndExecuteTransaction({
+            transaction: newPositionPayload,
+            signer: keypair,
+            options: {
+              showEffects: true,
+              showEvents: true,
+            },
+          });
+          
+          if (newPositionResult.effects?.status?.status !== 'success') {
+            throw new Error(`Failed to add liquidity on new position: ${newPositionResult.effects?.status?.error || 'Unknown error'}`);
+          }
+          
+          // Step 6: Success - log and return
+          logger.info('Liquidity added successfully on new position', {
+            digest: newPositionResult.digest,
+            amountA,
+            amountB,
+          });
+          
+          addResult = newPositionResult;
+        } catch (fallbackError) {
+          // Step 7: Fallback failed - throw original error
+          logger.error('Fallback attempt failed, throwing original error', fallbackError);
+          throw originalError;
+        }
+      }
       
       logger.info('Liquidity added successfully', {
         digest: addResult.digest,
