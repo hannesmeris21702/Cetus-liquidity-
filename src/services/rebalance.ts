@@ -466,6 +466,57 @@ export class RebalanceService {
   }
 
   /**
+   * Retry add liquidity transaction with fixed delay and retry on ANY error.
+   * This ensures that transient failures don't prevent liquidity from being added.
+   * 
+   * @param operation - The add liquidity operation to execute
+   * @param maxRetries - Maximum number of retry attempts (default: 3)
+   * @param delayMs - Fixed delay in milliseconds between retries (default: 3000)
+   * @returns The result of the operation
+   * @throws The original error if all retries fail
+   */
+  private async retryAddLiquidity<T>(
+    operation: () => Promise<T>,
+    maxRetries: number = 3,
+    delayMs: number = 3000
+  ): Promise<T> {
+    let lastError: Error | undefined;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await operation();
+        
+        // Log success with attempt number
+        if (attempt === 1) {
+          logger.info('Add liquidity succeeded on attempt 1');
+        } else {
+          logger.info(`Add liquidity succeeded on attempt ${attempt}`);
+        }
+        
+        return result;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        lastError = error instanceof Error ? error : new Error(errorMsg);
+        
+        if (attempt < maxRetries) {
+          // Log retry attempt
+          logger.warn(`Add liquidity attempt ${attempt} failed, retrying...`);
+          logger.debug(`Error details: ${errorMsg}`);
+          
+          // Wait before retrying
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        } else {
+          // All retries exhausted
+          logger.error(`Add liquidity failed after ${maxRetries} attempts`);
+        }
+      }
+    }
+    
+    // Preserve and throw the original error
+    throw lastError || new Error('Add liquidity failed with unknown error');
+  }
+
+  /**
    * Swap tokens within the pool.  Used to convert a single-sided token balance
    * into both tokens so that liquidity can be added to an in-range position.
    */
@@ -778,9 +829,9 @@ export class RebalanceService {
         rewarder_coin_types: [],
       };
       
-      // Add liquidity with retry logic
+      // Add liquidity with retry logic: max 3 retries, 3 second delay
       logger.info('Executing add liquidity transaction...');
-      const addResult = await this.retryTransaction(
+      const addResult = await this.retryAddLiquidity(
         async () => {
           // Refetch pool state on each retry to get latest version
           const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
@@ -810,9 +861,8 @@ export class RebalanceService {
           
           return result;
         },
-        'add liquidity',
-        2,
-        2000
+        3,
+        3000
       );
       
       logger.info('Liquidity added successfully', {
