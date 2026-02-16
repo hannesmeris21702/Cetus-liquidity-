@@ -21,7 +21,7 @@ const mockLogger = {
     this.logs.push({ level: 'error', message });
   },
   clearLogs() {
-    this.logs = [];
+    this.logs.length = 0;
   },
 };
 
