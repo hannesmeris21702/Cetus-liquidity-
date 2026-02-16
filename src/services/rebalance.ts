@@ -518,16 +518,25 @@ export class RebalanceService {
 
   /**
    * Detect if an error message indicates insufficient balance.
-   * Matches error patterns: "Insufficient balance", "expect", "amount is Insufficient"
+   * Matches error patterns: "Insufficient balance", "expect <amount>", "amount is Insufficient"
    */
   private isInsufficientBalanceError(errorMsg: string): boolean {
     const insufficientPatterns = [
       /insufficient balance/i,
-      /expect/i,
+      /expect\s+\d+/i, // More specific: matches "expect <number>" pattern
       /amount is insufficient/i,
     ];
     
     return insufficientPatterns.some(pattern => pattern.test(errorMsg));
+  }
+
+  /**
+   * Calculate swap amount with buffer for slippage.
+   * Adds a 10% buffer to account for slippage and ensure sufficient tokens.
+   */
+  private calculateSwapAmountWithBuffer(missingAmount: bigint): bigint {
+    const SWAP_BUFFER_PERCENTAGE = 110n; // 110% = 10% buffer
+    return (missingAmount * SWAP_BUFFER_PERCENTAGE) / 100n;
   }
 
   /**
@@ -572,21 +581,11 @@ export class RebalanceService {
         requiredB: requiredB.toString(),
       });
       
-      // Determine which token is insufficient
-      let isTokenAInsufficient = false;
-      let isTokenBInsufficient = false;
-      let missingAmountA = 0n;
-      let missingAmountB = 0n;
-      
-      if (currentBalanceA < requiredA) {
-        isTokenAInsufficient = true;
-        missingAmountA = requiredA - currentBalanceA;
-      }
-      
-      if (currentBalanceB < requiredB) {
-        isTokenBInsufficient = true;
-        missingAmountB = requiredB - currentBalanceB;
-      }
+      // Determine which token is insufficient and calculate missing amount
+      const isTokenAInsufficient = currentBalanceA < requiredA;
+      const isTokenBInsufficient = currentBalanceB < requiredB;
+      const missingAmountA = isTokenAInsufficient ? requiredA - currentBalanceA : 0n;
+      const missingAmountB = isTokenBInsufficient ? requiredB - currentBalanceB : 0n;
       
       // If neither token appears insufficient, log and return
       if (!isTokenAInsufficient && !isTokenBInsufficient) {
@@ -602,8 +601,8 @@ export class RebalanceService {
           missing: missingAmountA.toString(),
         });
         
-        // Swap B -> A for the missing amount (with some buffer for slippage)
-        const swapAmount = (missingAmountA * 110n) / 100n; // Add 10% buffer
+        // Swap B -> A for the missing amount (with buffer for slippage)
+        const swapAmount = this.calculateSwapAmountWithBuffer(missingAmountA);
         
         if (currentBalanceB >= swapAmount) {
           logger.info(`Swapping Token B → Token A`, { amount: swapAmount.toString() });
@@ -619,8 +618,8 @@ export class RebalanceService {
           missing: missingAmountB.toString(),
         });
         
-        // Swap A -> B for the missing amount (with some buffer for slippage)
-        const swapAmount = (missingAmountB * 110n) / 100n; // Add 10% buffer
+        // Swap A -> B for the missing amount (with buffer for slippage)
+        const swapAmount = this.calculateSwapAmountWithBuffer(missingAmountB);
         
         if (currentBalanceA >= swapAmount) {
           logger.info(`Swapping Token A → Token B`, { amount: swapAmount.toString() });

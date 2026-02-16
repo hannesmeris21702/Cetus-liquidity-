@@ -31,7 +31,7 @@ const mockLogger = {
 function isInsufficientBalanceError(errorMsg: string): boolean {
   const insufficientPatterns = [
     /insufficient balance/i,
-    /expect/i,
+    /expect\s+\d+/i, // More specific: matches "expect <number>" pattern
     /amount is insufficient/i,
   ];
   
@@ -54,20 +54,33 @@ async function runTests() {
     console.log('✔ Detects "Insufficient balance" error pattern');
   }
 
-  // Test 2: Detect "expect" error pattern
+  // Test 2: Detect "expect <number>" error pattern
   {
     const error1 = 'Transaction aborted: expect 1000, got 500';
-    const error2 = 'Error code 0x123: Expect sufficient balance';
-    const error3 = 'EXPECT amount to be greater than 0';
+    const error2 = 'Error code 0x123: Expect 5000 but received 3000';
+    const error3 = 'Abort: expect 100000 minimum';
     
-    assert.ok(isInsufficientBalanceError(error1), 'Should detect "expect" pattern (case 1)');
-    assert.ok(isInsufficientBalanceError(error2), 'Should detect "Expect" pattern (case 2)');
-    assert.ok(isInsufficientBalanceError(error3), 'Should detect "EXPECT" pattern (uppercase)');
+    assert.ok(isInsufficientBalanceError(error1), 'Should detect "expect 1000" pattern');
+    assert.ok(isInsufficientBalanceError(error2), 'Should detect "Expect 5000" pattern');
+    assert.ok(isInsufficientBalanceError(error3), 'Should detect "expect 100000" pattern');
     
-    console.log('✔ Detects "expect" error pattern');
+    console.log('✔ Detects "expect <number>" error pattern');
   }
 
-  // Test 3: Detect "amount is Insufficient" error
+  // Test 3: Should NOT detect generic "expect" without numbers
+  {
+    const error1 = 'Unexpected network error';
+    const error2 = 'Expected response format mismatch';
+    const error3 = 'This is not what we expected';
+    
+    assert.ok(!isInsufficientBalanceError(error1), 'Should NOT detect "Unexpected" without numbers');
+    assert.ok(!isInsufficientBalanceError(error2), 'Should NOT detect "Expected" without numbers');
+    assert.ok(!isInsufficientBalanceError(error3), 'Should NOT detect "expected" without numbers');
+    
+    console.log('✔ Does NOT falsely detect generic "expect" without numbers');
+  }
+
+  // Test 4: Detect "amount is Insufficient" error
   {
     const error1 = 'Error: amount is Insufficient for swap';
     const error2 = 'Verification failed: Amount is insufficient';
@@ -80,7 +93,7 @@ async function runTests() {
     console.log('✔ Detects "amount is Insufficient" error pattern');
   }
 
-  // Test 4: Should NOT detect unrelated errors
+  // Test 5: Should NOT detect unrelated errors
   {
     const error1 = 'Network timeout';
     const error2 = 'Invalid tick range';
@@ -95,16 +108,16 @@ async function runTests() {
     console.log('✔ Does NOT falsely detect unrelated errors');
   }
 
-  // Test 5: Case insensitive matching
+  // Test 6: Case insensitive matching
   {
     const variations = [
       'INSUFFICIENT BALANCE',
       'Insufficient Balance',
       'insufficient balance',
       'InSuFfIcIeNt BaLaNcE',
-      'EXPECT MORE',
-      'expect more',
-      'Expect More',
+      'EXPECT 1000',
+      'expect 500',
+      'Expect 12345',
       'AMOUNT IS INSUFFICIENT',
       'amount is insufficient',
       'Amount Is Insufficient',
@@ -120,7 +133,7 @@ async function runTests() {
     console.log('✔ Case-insensitive pattern matching works');
   }
 
-  // Test 6: Simulate balance analysis logic
+  // Test 7: Simulate balance analysis logic
   {
     // Mock balance scenario: Token A is insufficient
     const currentBalanceA = BigInt('1000000');
@@ -144,7 +157,7 @@ async function runTests() {
     console.log('✔ Balance analysis and missing amount calculation works');
   }
 
-  // Test 7: Simulate swap direction logic
+  // Test 8: Simulate swap direction logic
   {
     // Scenario 1: Token A insufficient -> Swap B to A (direction: false/B→A)
     const tokenAInsufficient = true;
@@ -161,7 +174,7 @@ async function runTests() {
     console.log('✔ Swap direction logic is correct');
   }
 
-  // Test 8: Verify recovery is only attempted once
+  // Test 9: Verify recovery is only attempted once
   {
     let recoveryAttempted = false;
     let recoveryCount = 0;
@@ -183,7 +196,7 @@ async function runTests() {
     console.log('✔ Recovery is only attempted once per transaction');
   }
 
-  // Test 9: Verify sufficient balance check before swap
+  // Test 10: Verify sufficient balance check before swap
   {
     // Scenario: Need to swap B→A, but not enough B
     const currentBalanceB = BigInt('500000');
@@ -195,14 +208,14 @@ async function runTests() {
     console.log('✔ Validates sufficient balance before attempting swap');
   }
 
-  // Test 10: Error message patterns from real scenarios
+  // Test 11: Error message patterns from real scenarios
   {
     const realWorldErrors = [
       'MoveAbort(MoveLocation { module: ModuleId { address: 0x1, name: Identifier("balance") }, function: 2, instruction: 9, function_name: Some("split") }, 0): Insufficient balance',
       'Error in execution: expect 5000000, but got 3000000',
       'Transaction failed: amount is Insufficient for the operation',
       'Execution error: Insufficient balance in coin',
-      'Abort: expected minimum balance not met',
+      'Abort: expect 100000 minimum balance not met',
     ];
     
     realWorldErrors.forEach(error => {
