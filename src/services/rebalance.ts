@@ -517,6 +517,127 @@ export class RebalanceService {
   }
 
   /**
+   * Detect if an error message indicates insufficient balance.
+   * Matches error patterns: "Insufficient balance", "expect", "amount is Insufficient"
+   */
+  private isInsufficientBalanceError(errorMsg: string): boolean {
+    const insufficientPatterns = [
+      /insufficient balance/i,
+      /expect/i,
+      /amount is insufficient/i,
+    ];
+    
+    return insufficientPatterns.some(pattern => pattern.test(errorMsg));
+  }
+
+  /**
+   * Attempt to recover from insufficient balance error by swapping tokens.
+   * This method:
+   * 1. Identifies which token is insufficient (A or B)
+   * 2. Calculates the missing amount
+   * 3. Swaps the opposite token to acquire the missing amount
+   */
+  private async attemptSwapRecovery(
+    poolInfo: PoolInfo,
+    errorMsg: string,
+    requestedAmountA: string,
+    requestedAmountB: string,
+    ownerAddress: string,
+    suiClient: any
+  ): Promise<void> {
+    try {
+      logger.info('Analyzing insufficient balance error...', { error: errorMsg });
+      
+      // Fetch current balances
+      const [balanceA, balanceB] = await Promise.all([
+        suiClient.getBalance({
+          owner: ownerAddress,
+          coinType: poolInfo.coinTypeA,
+        }),
+        suiClient.getBalance({
+          owner: ownerAddress,
+          coinType: poolInfo.coinTypeB,
+        }),
+      ]);
+      
+      const currentBalanceA = BigInt(balanceA.totalBalance);
+      const currentBalanceB = BigInt(balanceB.totalBalance);
+      const requiredA = BigInt(requestedAmountA);
+      const requiredB = BigInt(requestedAmountB);
+      
+      logger.info('Balance analysis:', {
+        currentBalanceA: currentBalanceA.toString(),
+        currentBalanceB: currentBalanceB.toString(),
+        requiredA: requiredA.toString(),
+        requiredB: requiredB.toString(),
+      });
+      
+      // Determine which token is insufficient
+      let isTokenAInsufficient = false;
+      let isTokenBInsufficient = false;
+      let missingAmountA = 0n;
+      let missingAmountB = 0n;
+      
+      if (currentBalanceA < requiredA) {
+        isTokenAInsufficient = true;
+        missingAmountA = requiredA - currentBalanceA;
+      }
+      
+      if (currentBalanceB < requiredB) {
+        isTokenBInsufficient = true;
+        missingAmountB = requiredB - currentBalanceB;
+      }
+      
+      // If neither token appears insufficient, log and return
+      if (!isTokenAInsufficient && !isTokenBInsufficient) {
+        logger.warn('Could not identify insufficient token from error, skipping recovery');
+        return;
+      }
+      
+      // Perform swap to acquire the missing token
+      if (isTokenAInsufficient) {
+        logger.info(`Insufficient balance detected for Token A`, {
+          required: requiredA.toString(),
+          current: currentBalanceA.toString(),
+          missing: missingAmountA.toString(),
+        });
+        
+        // Swap B -> A for the missing amount (with some buffer for slippage)
+        const swapAmount = (missingAmountA * 110n) / 100n; // Add 10% buffer
+        
+        if (currentBalanceB >= swapAmount) {
+          logger.info(`Swapping Token B → Token A`, { amount: swapAmount.toString() });
+          await this.performSwap(poolInfo, false, swapAmount.toString());
+          logger.info('Swap recovery completed for Token A');
+        } else {
+          throw new Error(`Insufficient Token B balance to swap for missing Token A. Need ${swapAmount.toString()}, have ${currentBalanceB.toString()}`);
+        }
+      } else if (isTokenBInsufficient) {
+        logger.info(`Insufficient balance detected for Token B`, {
+          required: requiredB.toString(),
+          current: currentBalanceB.toString(),
+          missing: missingAmountB.toString(),
+        });
+        
+        // Swap A -> B for the missing amount (with some buffer for slippage)
+        const swapAmount = (missingAmountB * 110n) / 100n; // Add 10% buffer
+        
+        if (currentBalanceA >= swapAmount) {
+          logger.info(`Swapping Token A → Token B`, { amount: swapAmount.toString() });
+          await this.performSwap(poolInfo, true, swapAmount.toString());
+          logger.info('Swap recovery completed for Token B');
+        } else {
+          throw new Error(`Insufficient Token A balance to swap for missing Token B. Need ${swapAmount.toString()}, have ${currentBalanceA.toString()}`);
+        }
+      }
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      logger.error('Swap recovery failed:', errMsg);
+      throw error;
+    }
+  }
+
+  /**
    * Swap tokens within the pool.  Used to convert a single-sided token balance
    * into both tokens so that liquidity can be added to an in-range position.
    */
@@ -829,37 +950,92 @@ export class RebalanceService {
         rewarder_coin_types: [],
       };
       
-      // Add liquidity with retry logic: max 3 retries, 3 second delay
+      // Add liquidity with retry logic and automatic swap recovery for insufficient balance
       logger.info('Executing add liquidity transaction...');
+      
+      let recoveryAttempted = false;
       const addResult = await this.retryAddLiquidity(
         async () => {
           // Refetch pool state on each retry to get latest version
           const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
           const currentSqrtPrice = new BN(pool.current_sqrt_price);
           
-          // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
-          const addLiquidityPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
-            addLiquidityParams as any,
-            {
-              slippage: this.config.maxSlippage,
-              curSqrtPrice: currentSqrtPrice,
+          try {
+            // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
+            const addLiquidityPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
+              addLiquidityParams as any,
+              {
+                slippage: this.config.maxSlippage,
+                curSqrtPrice: currentSqrtPrice,
+              }
+            );
+            
+            const result = await suiClient.signAndExecuteTransaction({
+              transaction: addLiquidityPayload,
+              signer: keypair,
+              options: {
+                showEffects: true,
+                showEvents: true,
+              },
+            });
+            
+            if (result.effects?.status?.status !== 'success') {
+              throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
             }
-          );
-          
-          const result = await suiClient.signAndExecuteTransaction({
-            transaction: addLiquidityPayload,
-            signer: keypair,
-            options: {
-              showEffects: true,
-              showEvents: true,
-            },
-          });
-          
-          if (result.effects?.status?.status !== 'success') {
-            throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
+            
+            return result;
+          } catch (txError) {
+            const errorMsg = txError instanceof Error ? txError.message : String(txError);
+            
+            // Check if this is an insufficient balance error and we haven't attempted recovery yet
+            if (!recoveryAttempted && this.isInsufficientBalanceError(errorMsg)) {
+              recoveryAttempted = true;
+              logger.info('Insufficient balance detected, attempting swap recovery...');
+              
+              // Attempt swap recovery
+              await this.attemptSwapRecovery(
+                poolInfo,
+                errorMsg,
+                amountA,
+                amountB,
+                ownerAddress,
+                suiClient
+              );
+              
+              // After swap, retry the add liquidity operation once
+              logger.info('Retrying add liquidity after swap recovery...');
+              
+              // Re-fetch pool state after swap
+              const poolAfterSwap = await sdk.Pool.getPool(poolInfo.poolAddress);
+              const currentSqrtPriceAfterSwap = new BN(poolAfterSwap.current_sqrt_price);
+              
+              const retryPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
+                addLiquidityParams as any,
+                {
+                  slippage: this.config.maxSlippage,
+                  curSqrtPrice: currentSqrtPriceAfterSwap,
+                }
+              );
+              
+              const retryResult = await suiClient.signAndExecuteTransaction({
+                transaction: retryPayload,
+                signer: keypair,
+                options: {
+                  showEffects: true,
+                  showEvents: true,
+                },
+              });
+              
+              if (retryResult.effects?.status?.status !== 'success') {
+                throw new Error(`Failed to add liquidity after recovery: ${retryResult.effects?.status?.error || 'Unknown error'}`);
+              }
+              
+              return retryResult;
+            }
+            
+            // If not an insufficient balance error or recovery already attempted, re-throw
+            throw txError;
           }
-          
-          return result;
         },
         3,
         3000
