@@ -16,10 +16,14 @@ import { PositionInfo } from '../src/services/monitor';
 
 function filterAndSelectPosition(positions: PositionInfo[]): PositionInfo | null {
   // Filter positions to only include those with liquidity > 0
-  const positionsWithLiquidity = positions.filter(p => 
-    p.liquidity != null && 
-    BigInt(p.liquidity) > 0n
-  );
+  const positionsWithLiquidity = positions.filter(p => {
+    if (!p.liquidity || p.liquidity === '') return false;
+    try {
+      return BigInt(p.liquidity) > 0n;
+    } catch {
+      return false;
+    }
+  });
 
   if (positionsWithLiquidity.length === 0) {
     return null;
