@@ -31,6 +31,8 @@ const mockLogger = {
 /**
  * Simulates the retryTransaction function for remove liquidity
  * It will retry on stale object and pending transaction errors only.
+ * Note: maxRetries represents the total number of attempts (not retries after initial attempt)
+ * For example, maxRetries=2 means: attempt 0, attempt 1 (2 total attempts, 1 retry)
  */
 async function retryTransaction<T>(
   operation: () => Promise<T>,
@@ -290,11 +292,11 @@ async function runTests() {
       assert.strictEqual(result.success, false, `Should fail for: ${errorMsg}`);
       assert.strictEqual(result.newPositionCreated, false, `Should NOT create position for: ${errorMsg}`);
       
-      // Should retry (maxRetries = 2 means 2 attempts total)
+      // removeLiquidity is called once, but internally retryTransaction makes multiple attempts
       const removeAttempts = mockLogger.logs.filter(
         log => log.message === 'Removing liquidity'
       );
-      assert.strictEqual(removeAttempts.length, 1, `Remove called once for: ${errorMsg}`);
+      assert.strictEqual(removeAttempts.length, 1, `removeLiquidity called once for: ${errorMsg}`);
       
       // Check for retry logs
       const retryLogs = mockLogger.logs.filter(
