@@ -1305,7 +1305,16 @@ export class RebalanceService {
       const poolInfo = await this.monitorService.getPoolInfo(poolAddress);
       const ownerAddress = this.sdkService.getAddress();
       const allPositions = await this.monitorService.getPositions(ownerAddress);
-      const poolPositions = allPositions.filter(p => p.poolAddress === poolAddress);
+      // Filter positions for this pool and exclude positions with zero liquidity
+      const poolPositions = allPositions.filter(p => {
+        if (p.poolAddress !== poolAddress) return false;
+        if (!p.liquidity || p.liquidity === '') return false;
+        try {
+          return BigInt(p.liquidity) > 0n;
+        } catch {
+          return false;
+        }
+      });
 
       // Determine which single position to track and rebalance.
       // The bot always manages exactly ONE position at a time.
@@ -1331,9 +1340,10 @@ export class RebalanceService {
         this.trackedPositionId = trackedPosition.positionId;
         logger.info('Auto-tracking position with most liquidity', {
           positionId: this.trackedPositionId,
+          liquidity: trackedPosition.liquidity,
         });
       } else {
-        logger.info('No existing positions found in pool — nothing to rebalance');
+        logger.info('No existing positions with liquidity > 0 found in pool — nothing to rebalance');
         return null;
       }
 
