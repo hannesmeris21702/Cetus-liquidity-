@@ -3,6 +3,11 @@ import { PositionMonitorService, PoolInfo, PositionInfo } from './monitor';
 import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
+import { 
+  TickMath, 
+  getCoinAFromLiquidity, 
+  getCoinBFromLiquidity 
+} from '@cetusprotocol/cetus-sui-clmm-sdk';
 
 export interface RebalanceResult {
   success: boolean;
@@ -70,6 +75,65 @@ export class RebalanceService {
     
     if (this.dryRun) {
       logger.warn('⚠️  DRY RUN MODE ENABLED - No real transactions will be executed');
+    }
+  }
+
+  /**
+   * Calculate the required token amounts for a given liquidity value in a specific tick range.
+   * This ensures that when we recreate a position, we maintain the SAME liquidity amount.
+   * 
+   * @param liquidity - The target liquidity value to preserve (as string)
+   * @param tickLower - Lower tick of the new position
+   * @param tickUpper - Upper tick of the new position
+   * @param currentSqrtPrice - Current sqrt price of the pool (as string)
+   * @returns Object with amountA and amountB as strings
+   */
+  private calculateTokenAmountsFromLiquidity(
+    liquidity: string,
+    tickLower: number,
+    tickUpper: number,
+    currentSqrtPrice: string
+  ): { amountA: string; amountB: string } {
+    try {
+      const liquidityBN = new BN(liquidity);
+      const currentSqrtPriceBN = new BN(currentSqrtPrice);
+      
+      // Get sqrt prices for the tick boundaries
+      const sqrtPriceLower = TickMath.tickIndexToSqrtPriceX64(tickLower);
+      const sqrtPriceUpper = TickMath.tickIndexToSqrtPriceX64(tickUpper);
+      
+      let amountA: BN;
+      let amountB: BN;
+      
+      // Calculate amounts based on where current price is relative to the range
+      if (currentSqrtPriceBN.lte(sqrtPriceLower)) {
+        // Current price below range - all liquidity in token A
+        amountA = getCoinAFromLiquidity(liquidityBN, sqrtPriceLower, sqrtPriceUpper, false);
+        amountB = new BN(0);
+      } else if (currentSqrtPriceBN.gte(sqrtPriceUpper)) {
+        // Current price above range - all liquidity in token B
+        amountA = new BN(0);
+        amountB = getCoinBFromLiquidity(liquidityBN, sqrtPriceLower, sqrtPriceUpper, false);
+      } else {
+        // Current price in range - liquidity in both tokens
+        amountA = getCoinAFromLiquidity(liquidityBN, currentSqrtPriceBN, sqrtPriceUpper, false);
+        amountB = getCoinBFromLiquidity(liquidityBN, sqrtPriceLower, currentSqrtPriceBN, false);
+      }
+      
+      logger.info('Calculated token amounts from target liquidity', {
+        targetLiquidity: liquidity,
+        tickRange: `[${tickLower}, ${tickUpper}]`,
+        amountA: amountA.toString(),
+        amountB: amountB.toString(),
+      });
+      
+      return {
+        amountA: amountA.toString(),
+        amountB: amountB.toString(),
+      };
+    } catch (error) {
+      logger.error('Failed to calculate token amounts from liquidity', error);
+      throw error;
     }
   }
 
@@ -185,51 +249,26 @@ export class RebalanceService {
       // Explicitly handle null/undefined and check for non-zero liquidity
       const hasLiquidity = position.liquidity != null && BigInt(position.liquidity) > 0n;
       
-      // Track token amounts freed by removing liquidity so we can re-add the same amount
-      let removedAmountA: string | undefined;
-      let removedAmountB: string | undefined;
+      // Capture the original liquidity value BEFORE removing the position
+      // This is the key value we need to preserve 1:1 when creating the new position
+      let originalLiquidity: string | undefined;
+      
+      if (hasLiquidity) {
+        originalLiquidity = position.liquidity;
+        logger.info('Captured original position liquidity: ' + originalLiquidity, {
+          positionId: position.positionId,
+          tickRange: `[${position.tickLower}, ${position.tickUpper}]`,
+        });
+      }
 
       if (hasLiquidity) {
         // Try to remove liquidity from old position
         try {
-          // Capture wallet balances before removal
-          const suiClient = this.sdkService.getSuiClient();
-          const ownerAddress = this.sdkService.getAddress();
-          const balanceBeforeA = await suiClient.getBalance({
-            owner: ownerAddress,
-            coinType: poolInfo.coinTypeA,
-          });
-          const balanceBeforeB = await suiClient.getBalance({
-            owner: ownerAddress,
-            coinType: poolInfo.coinTypeB,
-          });
-
           await this.removeLiquidity(position.positionId, position.liquidity);
-
-          // Capture wallet balances after removal to determine freed amounts
-          const balanceAfterA = await suiClient.getBalance({
-            owner: ownerAddress,
-            coinType: poolInfo.coinTypeA,
-          });
-          const balanceAfterB = await suiClient.getBalance({
-            owner: ownerAddress,
-            coinType: poolInfo.coinTypeB,
-          });
-
-          // Compute freed token amounts from wallet balance delta.
-          // Note: This approach assumes no concurrent transactions modify the wallet
-          // during the removal. For a single-wallet bot this is reliable. The Cetus SDK
-          // remove liquidity transaction does not directly expose returned token amounts.
-          const deltaA = BigInt(balanceAfterA.totalBalance) - BigInt(balanceBeforeA.totalBalance);
-          const deltaB = BigInt(balanceAfterB.totalBalance) - BigInt(balanceBeforeB.totalBalance);
-          // An out-of-range position may have all value in one token, so one delta may be 0
-          removedAmountA = deltaA > 0n ? deltaA.toString() : undefined;
-          removedAmountB = deltaB > 0n ? deltaB.toString() : undefined;
-
-          logger.info('Token amounts freed from removed position', {
-            removedAmountA: removedAmountA || '0',
-            removedAmountB: removedAmountB || '0',
-          });
+          
+          // Note: We've already captured the original liquidity value before removal.
+          // We'll calculate the required token amounts from the original liquidity and new tick range.
+          logger.info('Successfully removed liquidity from old position');
         } catch (removeError) {
           logger.error('Failed to remove liquidity from old position', removeError);
           // Log the error but continue to try adding liquidity to new position
@@ -254,8 +293,14 @@ export class RebalanceService {
       }
 
       // Add liquidity to existing in-range position or create a new one
-      // Pass the removed token amounts so the same liquidity is re-added
-      const result = await this.addLiquidity(poolInfo, lower, upper, existingInRangePosition?.positionId, removedAmountA, removedAmountB);
+      // Pass the original liquidity value so we preserve the SAME liquidity amount
+      const result = await this.addLiquidity(
+        poolInfo, 
+        lower, 
+        upper, 
+        existingInRangePosition?.positionId, 
+        originalLiquidity
+      );
 
       // If a new position was created, discover it and update tracking so
       // subsequent cycles manage the new position instead of the old one.
@@ -719,14 +764,14 @@ export class RebalanceService {
     tickLower: number,
     tickUpper: number,
     existingPositionId?: string,
-    removedAmountA?: string,
-    removedAmountB?: string
+    originalLiquidity?: string
   ): Promise<{ transactionDigest?: string }> {
     try {
       logger.info('Adding liquidity', {
         poolAddress: poolInfo.poolAddress,
         tickLower,
         tickUpper,
+        originalLiquidity: originalLiquidity || 'not specified',
       });
 
       const sdk = this.sdkService.getSdk();
@@ -751,13 +796,6 @@ export class RebalanceService {
         coinTypeB: poolInfo.coinTypeB,
       });
 
-      // Use removed amounts (from rebalance) if available, otherwise fall back to
-      // configured amounts or a portion of available balance
-      // Use BigInt arithmetic to avoid precision loss with large numbers
-      const balanceABigInt = BigInt(balanceA.totalBalance);
-      const balanceBBigInt = BigInt(balanceB.totalBalance);
-      const defaultMinAmount = 1000n;
-
       // Reserve gas when a token is SUI so the add-liquidity transaction
       // does not try to spend the entire balance and fail with balance::split.
       const SUI_GAS_RESERVE = BigInt(this.config.gasBudget); // e.g. 0.1 SUI
@@ -766,6 +804,9 @@ export class RebalanceService {
       const isSuiCoinType = (ct: string) => ct === SUI_TYPE || ct === SUI_TYPE_FULL;
       const isSuiA = isSuiCoinType(poolInfo.coinTypeA);
       const isSuiB = isSuiCoinType(poolInfo.coinTypeB);
+      
+      const balanceABigInt = BigInt(balanceA.totalBalance);
+      const balanceBBigInt = BigInt(balanceB.totalBalance);
       const safeBalanceA = isSuiA && balanceABigInt > SUI_GAS_RESERVE
         ? balanceABigInt - SUI_GAS_RESERVE
         : balanceABigInt;
@@ -776,101 +817,149 @@ export class RebalanceService {
       let amountA: string;
       let amountB: string;
       
-      if (removedAmountA || removedAmountB) {
-        // Rebalancing: use exactly the token amounts freed from the old position
-        // so the new position carries the same liquidity value.
-        // For out-of-range positions one token may be 0 — keep it as 0 and let
-        // the swap logic below convert half of the non-zero token.
-        // Cap at safe balance to handle gas-cost deductions (e.g. when one of
-        // the tokens is SUI, removal gas reduces the balance delta).
-        const removedA = removedAmountA ? BigInt(removedAmountA) : 0n;
-        const removedB = removedAmountB ? BigInt(removedAmountB) : 0n;
-        amountA = (removedA > 0n ? (removedA <= safeBalanceA ? removedA : safeBalanceA) : 0n).toString();
-        amountB = (removedB > 0n ? (removedB <= safeBalanceB ? removedB : safeBalanceB) : 0n).toString();
-        logger.info('Using removed position amounts for rebalance', { amountA, amountB });
+      if (originalLiquidity) {
+        // Rebalancing: Calculate the required token amounts from the SAME liquidity value
+        // This ensures we preserve the liquidity amount 1:1 when moving to a new tick range
+        logger.info('Calculating required token amounts from original liquidity', {
+          originalLiquidity,
+          newTickRange: `[${tickLower}, ${tickUpper}]`,
+        });
+        
+        const calculatedAmounts = this.calculateTokenAmountsFromLiquidity(
+          originalLiquidity,
+          tickLower,
+          tickUpper,
+          poolInfo.currentSqrtPrice
+        );
+        
+        // Cap at safe balance to handle cases where gas costs reduced the available balance
+        const calculatedA = BigInt(calculatedAmounts.amountA);
+        const calculatedB = BigInt(calculatedAmounts.amountB);
+        amountA = (calculatedA > 0n ? (calculatedA <= safeBalanceA ? calculatedA : safeBalanceA) : 0n).toString();
+        amountB = (calculatedB > 0n ? (calculatedB <= safeBalanceB ? calculatedB : safeBalanceB) : 0n).toString();
+        
+        logger.info('Required token amounts for target liquidity', { 
+          amountA, 
+          amountB,
+          cappedToBalance: calculatedA > safeBalanceA || calculatedB > safeBalanceB
+        });
       } else {
+        // Initial position creation: use configured amounts or a portion of available balance
+        const defaultMinAmount = 1000n;
         amountA = this.config.tokenAAmount || String(safeBalanceA > 0n ? safeBalanceA / 10n : defaultMinAmount);
         amountB = this.config.tokenBAmount || String(safeBalanceB > 0n ? safeBalanceB / 10n : defaultMinAmount);
+        logger.info('Using configured amounts for initial position', { amountA, amountB });
       }
 
-      // When one token has zero balance (common after removing an out-of-range
-      // position that was fully single-sided), swap approximately half of the
-      // available token so that both tokens are non-zero.  An in-range position
-      // requires non-zero amounts of both tokens; without this step the Cetus
-      // Move contract aborts with error 0 in repay_add_liquidity.
-      {
-        const preSwapA = BigInt(amountA);
-        const preSwapB = BigInt(amountB);
-        const oneIsZero =
-          (preSwapA === 0n && preSwapB > 0n) ||
-          (preSwapA > 0n && preSwapB === 0n);
-
-        if (oneIsZero) {
-          const hasOnlyA = preSwapA > 0n;
-          const swapAmount = (hasOnlyA ? preSwapA : preSwapB) / 2n;
-
-          if (swapAmount > 0n) {
-            logger.info(
-              'One token has zero balance - swapping to obtain both tokens',
-              { direction: hasOnlyA ? 'A→B' : 'B→A', swapAmount: swapAmount.toString() },
-            );
-
-            try {
-              // Capture wallet balances before swap so we can compute the
-              // delta and re-add only the freed liquidity — not the entire wallet.
-              const preSwapBalA = await suiClient.getBalance({
-                owner: ownerAddress,
-                coinType: poolInfo.coinTypeA,
-              });
-              const preSwapBalB = await suiClient.getBalance({
-                owner: ownerAddress,
-                coinType: poolInfo.coinTypeB,
-              });
-
-              await this.performSwap(poolInfo, hasOnlyA, swapAmount.toString());
-
-              // Re-fetch wallet balances after swap
-              const postSwapBalA = await suiClient.getBalance({
-                owner: ownerAddress,
-                coinType: poolInfo.coinTypeA,
-              });
-              const postSwapBalB = await suiClient.getBalance({
-                owner: ownerAddress,
-                coinType: poolInfo.coinTypeB,
-              });
-
-              // Compute swap deltas and adjust the freed amounts accordingly.
-              // This ensures we only re-add the liquidity that came from the
-              // old position, not pre-existing wallet funds.
-              const swapDeltaA = BigInt(postSwapBalA.totalBalance) - BigInt(preSwapBalA.totalBalance);
-              const swapDeltaB = BigInt(postSwapBalB.totalBalance) - BigInt(preSwapBalB.totalBalance);
-
-              let adjustedAmountA = preSwapA + swapDeltaA;
-              let adjustedAmountB = preSwapB + swapDeltaB;
-
-              // Reserve gas when SUI is one of the tokens
-              if (isSuiA) {
-                const walletA = BigInt(postSwapBalA.totalBalance);
-                const maxUsableA = walletA > SUI_GAS_RESERVE ? walletA - SUI_GAS_RESERVE : 0n;
-                if (adjustedAmountA > maxUsableA) adjustedAmountA = maxUsableA;
+      // Check if we have insufficient balance and need to swap to meet the required amounts
+      // This handles cases where the calculated amounts from liquidity exceed wallet balances
+      if (originalLiquidity) {
+        const requiredA = BigInt(amountA);
+        const requiredB = BigInt(amountB);
+        const currentBalA = safeBalanceA;
+        const currentBalB = safeBalanceB;
+        
+        const needsSwapForA = requiredA > currentBalA;
+        const needsSwapForB = requiredB > currentBalB;
+        
+        if (needsSwapForA || needsSwapForB) {
+          logger.info('Insufficient balance detected - swapping to meet required amounts', {
+            requiredA: requiredA.toString(),
+            currentBalA: currentBalA.toString(),
+            requiredB: requiredB.toString(),
+            currentBalB: currentBalB.toString(),
+          });
+          
+          try {
+            if (needsSwapForA && !needsSwapForB) {
+              // Need more A, swap B → A
+              const missingA = requiredA - currentBalA;
+              const swapAmount = this.calculateSwapAmountWithBuffer(missingA);
+              
+              if (currentBalB >= swapAmount) {
+                logger.info('Swapping Token B → Token A for missing amount', {
+                  missing: missingA.toString(),
+                  swapAmount: swapAmount.toString()
+                });
+                await this.performSwap(poolInfo, false, swapAmount.toString());
+                
+                // Update amountB to reflect what we have left after swap
+                amountB = (currentBalB - swapAmount).toString();
+              } else {
+                logger.warn(`Insufficient Token B to swap for missing Token A. Need ${swapAmount.toString()}, have ${currentBalB.toString()}`);
               }
-              if (isSuiB) {
-                const walletB = BigInt(postSwapBalB.totalBalance);
-                const maxUsableB = walletB > SUI_GAS_RESERVE ? walletB - SUI_GAS_RESERVE : 0n;
-                if (adjustedAmountB > maxUsableB) adjustedAmountB = maxUsableB;
+            } else if (needsSwapForB && !needsSwapForA) {
+              // Need more B, swap A → B
+              const missingB = requiredB - currentBalB;
+              const swapAmount = this.calculateSwapAmountWithBuffer(missingB);
+              
+              if (currentBalA >= swapAmount) {
+                logger.info('Swapping Token A → Token B for missing amount', {
+                  missing: missingB.toString(),
+                  swapAmount: swapAmount.toString()
+                });
+                await this.performSwap(poolInfo, true, swapAmount.toString());
+                
+                // Update amountA to reflect what we have left after swap
+                amountA = (currentBalA - swapAmount).toString();
+              } else {
+                logger.warn(`Insufficient Token A to swap for missing Token B. Need ${swapAmount.toString()}, have ${currentBalA.toString()}`);
               }
-
-              amountA = (adjustedAmountA > 0n ? adjustedAmountA : 0n).toString();
-              amountB = (adjustedAmountB > 0n ? adjustedAmountB : 0n).toString();
-
-              logger.info('Post-swap amounts (removed position liquidity adjusted by swap deltas)', { amountA, amountB });
-            } catch (swapError) {
-              const swapMsg = swapError instanceof Error ? swapError.message : String(swapError);
-              logger.warn(
-                `Swap failed (${swapMsg}) - will attempt add liquidity with available amounts`,
-              );
             }
+            
+            // After swap, re-fetch balances and recalculate amounts if needed
+            const updatedBalanceA = await suiClient.getBalance({
+              owner: ownerAddress,
+              coinType: poolInfo.coinTypeA,
+            });
+            const updatedBalanceB = await suiClient.getBalance({
+              owner: ownerAddress,
+              coinType: poolInfo.coinTypeB,
+            });
+            
+            const updatedBalA = BigInt(updatedBalanceA.totalBalance);
+            const updatedBalB = BigInt(updatedBalanceB.totalBalance);
+            const updatedSafeBalA = isSuiA && updatedBalA > SUI_GAS_RESERVE
+              ? updatedBalA - SUI_GAS_RESERVE
+              : updatedBalA;
+            const updatedSafeBalB = isSuiB && updatedBalB > SUI_GAS_RESERVE
+              ? updatedBalB - SUI_GAS_RESERVE
+              : updatedBalB;
+            
+            // Use the minimum of required and available after swap
+            amountA = (requiredA <= updatedSafeBalA ? requiredA : updatedSafeBalA).toString();
+            amountB = (requiredB <= updatedSafeBalB ? requiredB : updatedSafeBalB).toString();
+            
+            logger.info('Amounts after swap adjustment', { amountA, amountB });
+          } catch (swapError) {
+            logger.warn('Swap failed, will use available balance', swapError);
+            // Cap to available balance if swap fails
+            amountA = currentBalA.toString();
+            amountB = currentBalB.toString();
           }
+        }
+      }
+
+      // When one token has zero balance (could happen if calculated amounts are zero
+      // or if we're creating an initial position), we may need to handle edge cases.
+      // However, with our new liquidity-based approach, both amounts should be calculated
+      // based on the liquidity value and current price, so this should be rare.
+      {
+        const finalA = BigInt(amountA);
+        const finalB = BigInt(amountB);
+        
+        if (finalA === 0n && finalB === 0n) {
+          throw new Error('Both token amounts are zero - cannot add liquidity');
+        }
+        
+        // For in-range positions, we need both tokens. If one is zero, it indicates
+        // the position would be out of range, which is acceptable.
+        if ((finalA === 0n || finalB === 0n) && originalLiquidity) {
+          logger.info('One token amount is zero - position may be out of range', {
+            amountA: finalA.toString(),
+            amountB: finalB.toString(),
+            tickRange: `[${tickLower}, ${tickUpper}]`,
+          });
         }
       }
 
@@ -879,17 +968,17 @@ export class RebalanceService {
         const amountABigInt = BigInt(amountA);
         const amountBBigInt = BigInt(amountB);
         
-        if (removedAmountA || removedAmountB) {
-          // During rebalance, an out-of-range position may have all value in one token.
-          // After falling back to wallet balance, both should be non-zero if possible.
+        if (originalLiquidity) {
+          // During rebalance with preserved liquidity, an out-of-range position may have all value in one token.
           if (amountABigInt === 0n && amountBBigInt === 0n) {
             throw new Error('No tokens available for rebalancing. Wallet has insufficient balance of both tokens.');
           }
+          // One token being zero is acceptable for out-of-range positions
           if (amountABigInt === 0n || amountBBigInt === 0n) {
-            logger.warn('One token still has zero balance after swap attempt. ' +
-              'The add liquidity transaction will likely fail. Consider manually providing both tokens.');
+            logger.info('One token is zero - this is expected for out-of-range positions');
           }
         } else {
+          // For initial position creation, we need both tokens
           if (amountABigInt === 0n || amountBBigInt === 0n) {
             throw new Error('Insufficient token balance to add liquidity. Please ensure you have both tokens in your wallet.');
           }
