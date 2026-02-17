@@ -31,8 +31,15 @@ const mockLogger = {
 /**
  * Simulates the retryTransaction function for remove liquidity
  * It will retry on stale object and pending transaction errors only.
- * Note: maxRetries represents the total number of attempts (not retries after initial attempt)
- * For example, maxRetries=2 means: attempt 0, attempt 1 (2 total attempts, 1 retry)
+ * 
+ * NOTE: Despite the parameter name 'maxRetries', this represents the TOTAL number of attempts
+ * (including the initial attempt), not the number of retries after the first attempt.
+ * This matches the actual implementation in src/services/rebalance.ts.
+ * 
+ * For example:
+ *   maxRetries=1 → 1 attempt total (0 retries)
+ *   maxRetries=2 → 2 attempts total (1 retry after initial)
+ *   maxRetries=3 → 3 attempts total (2 retries after initial)
  */
 async function retryTransaction<T>(
   operation: () => Promise<T>,
