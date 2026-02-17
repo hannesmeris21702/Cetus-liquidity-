@@ -859,8 +859,8 @@ export class RebalanceService {
         const currentBalA = safeBalanceA;
         const currentBalB = safeBalanceB;
         
-        const needsSwapForA = requiredA > currentBalA && currentBalA < requiredA;
-        const needsSwapForB = requiredB > currentBalB && currentBalB < requiredB;
+        const needsSwapForA = requiredA > currentBalA;
+        const needsSwapForB = requiredB > currentBalB;
         
         if (needsSwapForA || needsSwapForB) {
           logger.info('Insufficient balance detected - swapping to meet required amounts', {
