@@ -262,19 +262,13 @@ export class RebalanceService {
       }
 
       if (hasLiquidity) {
-        // Try to remove liquidity from old position
-        try {
-          await this.removeLiquidity(position.positionId, position.liquidity);
-          
-          // Note: We've already captured the original liquidity value before removal.
-          // We'll calculate the required token amounts from the original liquidity and new tick range.
-          logger.info('Successfully removed liquidity from old position');
-        } catch (removeError) {
-          logger.error('Failed to remove liquidity from old position', removeError);
-          // Log the error but continue to try adding liquidity to new position
-          // This handles the case where position already has no liquidity
-          logger.info('Continuing with adding liquidity to new position despite removal failure');
-        }
+        // Remove liquidity from old position before creating new position
+        // If this fails after retries, the error will propagate and abort the rebalance
+        await this.removeLiquidity(position.positionId, position.liquidity);
+        
+        // Note: We've already captured the original liquidity value before removal.
+        // We'll calculate the required token amounts from the original liquidity and new tick range.
+        logger.info('Successfully removed liquidity from old position');
       } else {
         logger.info('Position has no liquidity - skipping removal step');
       }
