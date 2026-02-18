@@ -48,7 +48,7 @@ function testTickConversion() {
   {
     const tick = -1141204;
     const tickString = String(tick);
-    const parsed = parseInt(tickString);
+    const parsed = parseInt(tickString, 10);
     assert.strictEqual(parsed, tick, 'String representation should be parseable back to original number');
     console.log('✔ Round-trip conversion: -1141204 → "-1141204" → -1141204');
   }
