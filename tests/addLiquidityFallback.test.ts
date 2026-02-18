@@ -188,21 +188,23 @@ async function testFallbackFailureThrowsOriginalError() {
   let caughtError: Error | null = null;
   
   try {
-    // Simulate retry failure
-    throw originalError;
-  } catch (retryError) {
-    if (!isOpen) {
-      mockLogger.warn('Add liquidity failed after retries, opening new position');
-      
-      try {
-        // Simulate fallback failure
-        mockLogger.info('Retrying add liquidity on new position');
-        throw new Error('Fallback also failed');
-      } catch (fallbackError) {
-        // Should throw original error, not fallback error
-        mockLogger.error('Fallback attempt failed, throwing original error', fallbackError);
-        caughtError = retryError as Error;
-        throw retryError;
+    try {
+      // Simulate retry failure
+      throw originalError;
+    } catch (retryError) {
+      if (!isOpen) {
+        mockLogger.warn('Add liquidity failed after retries, opening new position');
+        
+        try {
+          // Simulate fallback failure
+          mockLogger.info('Retrying add liquidity on new position');
+          throw new Error('Fallback also failed');
+        } catch (fallbackError) {
+          // Should throw original error, not fallback error
+          mockLogger.error('Fallback attempt failed, throwing original error', fallbackError);
+          caughtError = retryError as Error;
+          throw retryError;
+        }
       }
     }
   } catch (finalError) {
@@ -228,18 +230,20 @@ async function testOnlyOneFallbackAttempt() {
   let fallbackAttempts = 0;
   
   try {
-    throw new Error('Initial failure');
-  } catch (retryError) {
-    if (!isOpen) {
-      fallbackAttempts++;
-      
-      try {
-        // Simulate fallback attempt
-        throw new Error('Fallback failed');
-      } catch (fallbackError) {
-        // Should NOT loop back to try another fallback
-        // Should throw immediately
-        throw retryError;
+    try {
+      throw new Error('Initial failure');
+    } catch (retryError) {
+      if (!isOpen) {
+        fallbackAttempts++;
+        
+        try {
+          // Simulate fallback attempt
+          throw new Error('Fallback failed');
+        } catch (fallbackError) {
+          // Should NOT loop back to try another fallback
+          // Should throw immediately
+          throw retryError;
+        }
       }
     }
   } catch (finalError) {
