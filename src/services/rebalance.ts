@@ -450,6 +450,7 @@ export class RebalanceService {
           };
 
           const removeLiquidityPayload = await sdk.Position.removeLiquidityTransactionPayload(params as any);
+          removeLiquidityPayload.setGasBudget(this.config.gasBudget);
           
           const txResult = await suiClient.signAndExecuteTransaction({
             transaction: removeLiquidityPayload,
@@ -780,11 +781,14 @@ export class RebalanceService {
       coinTypeA: poolInfo.coinTypeA,
       coinTypeB: poolInfo.coinTypeB,
     });
+    swapPayload.setGasBudget(this.config.gasBudget);
 
     const result = await suiClient.signAndExecuteTransaction({
       transaction: swapPayload,
       signer: keypair,
-      options: { showEffects: true },
+      options: { 
+        showEffects: true,
+      },
     });
 
     if (result.effects?.status?.status !== 'success') {
@@ -1100,6 +1104,7 @@ export class RebalanceService {
                   curSqrtPrice: currentSqrtPrice,
                 }
               );
+              addLiquidityPayload.setGasBudget(this.config.gasBudget);
               
               const result = await suiClient.signAndExecuteTransaction({
                 transaction: addLiquidityPayload,
@@ -1147,6 +1152,7 @@ export class RebalanceService {
                     curSqrtPrice: currentSqrtPrice,
                   }
                 );
+                retryPayload.setGasBudget(this.config.gasBudget);
                 
                 const retryResult = await suiClient.signAndExecuteTransaction({
                   transaction: retryPayload,
@@ -1288,6 +1294,7 @@ export class RebalanceService {
               curSqrtPrice: freshSqrtPrice,
             }
           );
+          newPositionPayload.setGasBudget(this.config.gasBudget);
           
           const newPositionResult = await suiClient.signAndExecuteTransaction({
             transaction: newPositionPayload,
