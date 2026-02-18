@@ -224,11 +224,9 @@ async function runTests() {
       assert.fail('Should throw error when insufficient balance for swap');
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      // Debug: print the actual error
-      console.log('  Debug - Actual error:', errorMsg);
       assert.ok(
-        errorMsg.includes('Insufficient Token B') || errorMsg.includes('insufficient'),
-        `Should throw error about insufficient balance for swap. Got: ${errorMsg}`
+        errorMsg.includes('insufficient'),
+        `Should throw error about insufficient balance for swap`
       );
     }
 
