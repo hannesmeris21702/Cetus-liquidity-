@@ -983,64 +983,46 @@ export class RebalanceService {
         }
       }
 
-      // Refetch balances after all swap operations to get the CURRENT state
-      // This is critical because remove liquidity and swap transactions consumed gas,
-      // making the earlier balance calculations stale.
-      const finalBalances = await Promise.all([
-        suiClient.getBalance({
-          owner: ownerAddress,
-          coinType: poolInfo.coinTypeA,
-        }),
-        suiClient.getBalance({
-          owner: ownerAddress,
-          coinType: poolInfo.coinTypeB,
-        }),
-      ]);
-      
-      const finalBalanceA = BigInt(finalBalances[0].totalBalance);
-      const finalBalanceB = BigInt(finalBalances[1].totalBalance);
-      
-      // Recalculate safe balances with gas reserve for the upcoming add liquidity transaction
-      const finalSafeBalanceA = isSuiA && finalBalanceA > SUI_GAS_RESERVE
-        ? finalBalanceA - SUI_GAS_RESERVE
-        : finalBalanceA;
-      const finalSafeBalanceB = isSuiB && finalBalanceB > SUI_GAS_RESERVE
-        ? finalBalanceB - SUI_GAS_RESERVE
-        : finalBalanceB;
-      
-      // Cap the amounts to the actual available balance after all operations
-      const amountABigInt = BigInt(amountA);
-      const amountBBigInt = BigInt(amountB);
-      const finalAmountA = amountABigInt > finalSafeBalanceA ? finalSafeBalanceA : amountABigInt;
-      const finalAmountB = amountBBigInt > finalSafeBalanceB ? finalSafeBalanceB : amountBBigInt;
-      
-      // Update amounts to the final capped values
-      amountA = finalAmountA.toString();
-      amountB = finalAmountB.toString();
-      
-      logger.info('Final amounts after balance refetch and gas reserve', {
-        finalBalanceA: finalBalanceA.toString(),
-        finalBalanceB: finalBalanceB.toString(),
-        finalSafeBalanceA: finalSafeBalanceA.toString(),
-        finalSafeBalanceB: finalSafeBalanceB.toString(),
-        finalAmountA: amountA,
-        finalAmountB: amountB,
-      });
-      
+      // When one token has zero balance (could happen if calculated amounts are zero
+      // or if we're creating an initial position), we may need to handle edge cases.
+      // However, with our new liquidity-based approach, both amounts should be calculated
+      // based on the liquidity value and current price, so this should be rare.
+      {
+        const finalA = BigInt(amountA);
+        const finalB = BigInt(amountB);
+        
+        if (finalA === 0n && finalB === 0n) {
+          throw new Error('Both token amounts are zero - cannot add liquidity');
+        }
+        
+        // For in-range positions, we need both tokens. If one is zero, it indicates
+        // the position would be out of range, which is acceptable.
+        if ((finalA === 0n || finalB === 0n) && preservedAmounts) {
+          logger.info('One token amount is zero - position may be out of range', {
+            amountA: finalA.toString(),
+            amountB: finalB.toString(),
+            tickRange: `[${tickLower}, ${tickUpper}]`,
+          });
+        }
+      }
+
       // Validate amounts
       try {
+        const amountABigInt = BigInt(amountA);
+        const amountBBigInt = BigInt(amountB);
+        
         if (preservedAmounts) {
           // During rebalance with preserved liquidity VALUE, an out-of-range position may have all value in one token.
-          if (finalAmountA === 0n && finalAmountB === 0n) {
+          if (amountABigInt === 0n && amountBBigInt === 0n) {
             throw new Error('No tokens available for rebalancing. Wallet has insufficient balance of both tokens.');
           }
           // One token being zero is acceptable for out-of-range positions
-          if (finalAmountA === 0n || finalAmountB === 0n) {
+          if (amountABigInt === 0n || amountBBigInt === 0n) {
             logger.info('One token is zero - this is expected for out-of-range positions');
           }
         } else {
           // For initial position creation, we need both tokens
-          if (finalAmountA === 0n || finalAmountB === 0n) {
+          if (amountABigInt === 0n || amountBBigInt === 0n) {
             throw new Error('Insufficient token balance to add liquidity. Please ensure you have both tokens in your wallet.');
           }
         }
