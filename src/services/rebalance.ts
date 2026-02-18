@@ -826,16 +826,16 @@ export class RebalanceService {
           poolInfo.currentSqrtPrice
         );
         
-        // Cap at safe balance to handle cases where gas costs reduced the available balance
+        // Store the calculated required amounts WITHOUT capping
+        // We need the actual required amounts to determine if we need to swap
         const calculatedA = BigInt(calculatedAmounts.amountA);
         const calculatedB = BigInt(calculatedAmounts.amountB);
-        amountA = (calculatedA > 0n ? (calculatedA <= safeBalanceA ? calculatedA : safeBalanceA) : 0n).toString();
-        amountB = (calculatedB > 0n ? (calculatedB <= safeBalanceB ? calculatedB : safeBalanceB) : 0n).toString();
+        amountA = calculatedA.toString();
+        amountB = calculatedB.toString();
         
         logger.info('Required token amounts for target liquidity', { 
           amountA, 
           amountB,
-          cappedToBalance: calculatedA > safeBalanceA || calculatedB > safeBalanceB
         });
       } else {
         // Initial position creation: use configured amounts or a portion of available balance
@@ -846,7 +846,7 @@ export class RebalanceService {
       }
 
       // Check if we have insufficient balance and need to swap to meet the required amounts
-      // This handles cases where the calculated amounts from liquidity exceed wallet balances
+      // Compare the REQUIRED amounts (not capped) with current wallet balances
       if (originalLiquidity) {
         const requiredA = BigInt(amountA);
         const requiredB = BigInt(amountB);
@@ -901,7 +901,7 @@ export class RebalanceService {
               }
             }
             
-            // After swap, re-fetch balances and recalculate amounts if needed
+            // After swap, re-fetch balances and cap amounts to what's actually available
             const updatedBalanceA = await suiClient.getBalance({
               owner: ownerAddress,
               coinType: poolInfo.coinTypeA,
@@ -931,6 +931,17 @@ export class RebalanceService {
             amountA = currentBalA.toString();
             amountB = currentBalB.toString();
           }
+        } else {
+          // Both token balances are sufficient, proceed directly
+          // Cap amounts to safe balance to handle edge cases (e.g., gas costs)
+          logger.info('Token balances are sufficient, proceeding to add liquidity', {
+            requiredA: requiredA.toString(),
+            availableA: currentBalA.toString(),
+            requiredB: requiredB.toString(),
+            availableB: currentBalB.toString(),
+          });
+          amountA = (requiredA <= currentBalA ? requiredA : currentBalA).toString();
+          amountB = (requiredB <= currentBalB ? requiredB : currentBalB).toString();
         }
       }
 
