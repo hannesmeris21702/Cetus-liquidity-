@@ -39,8 +39,8 @@ interface RemoveLiquidityParams {
 interface AddLiquidityFixTokenParams {
   pool_id: string;
   pos_id: string;
-  tick_lower: number;
-  tick_upper: number;
+  tick_lower: string | number;
+  tick_upper: string | number;
   amount_a: string;
   amount_b: string;
   slippage: number;
@@ -1061,11 +1061,12 @@ export class RebalanceService {
 
       // Use the SDK's fix token method which automatically calculates liquidity.
       // When is_open is true the SDK opens the position and adds liquidity atomically.
+      // Convert tick values to strings to handle negative values correctly (SDK expects string | number)
       const addLiquidityParams: AddLiquidityFixTokenParams = {
         pool_id: poolInfo.poolAddress,
         pos_id: positionId,
-        tick_lower: tickLower,
-        tick_upper: tickUpper,
+        tick_lower: String(tickLower),
+        tick_upper: String(tickUpper),
         amount_a: amountA,
         amount_b: amountB,
         slippage: this.config.maxSlippage,
@@ -1259,11 +1260,12 @@ export class RebalanceService {
           // Step 5: Open new position and retry add liquidity once
           logger.info('Retrying add liquidity on new position');
           
+          // Convert tick values to strings to handle negative values correctly (SDK expects string | number)
           const newPositionParams: AddLiquidityFixTokenParams = {
             pool_id: poolInfo.poolAddress,
             pos_id: '', // Empty for new position
-            tick_lower: tickLower,
-            tick_upper: tickUpper,
+            tick_lower: String(tickLower),
+            tick_upper: String(tickUpper),
             amount_a: amountA,
             amount_b: amountB,
             slippage: this.config.maxSlippage,
