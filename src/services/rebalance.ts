@@ -468,7 +468,7 @@ export class RebalanceService {
           return txResult;
         },
         'remove liquidity',
-        2,
+        3,
         2000
       );
 
