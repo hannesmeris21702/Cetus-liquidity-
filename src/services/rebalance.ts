@@ -3,6 +3,7 @@ import { PositionMonitorService, PoolInfo, PositionInfo } from './monitor';
 import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
+import type { BalanceChange } from '@mysten/sui/client';
 
 export interface RebalanceResult {
   success: boolean;
@@ -185,12 +186,17 @@ export class RebalanceService {
       // Explicitly handle null/undefined and check for non-zero liquidity
       const hasLiquidity = position.liquidity != null && BigInt(position.liquidity) > 0n;
 
+      let closedPositionAmounts: { amountA: string; amountB: string } | undefined;
+
       if (hasLiquidity) {
-        // Remove liquidity from old position. The zap-based addLiquidity will
-        // use whatever tokens are available in the wallet after removal.
-        await this.removeLiquidity(position.positionId, position.liquidity);
+        // Remove liquidity from old position and capture the freed token amounts.
+        // These are used as the zap inputs for the new position so only the
+        // tokens freed from the closed position are re-deployed.
+        closedPositionAmounts = await this.removeLiquidity(position.positionId, position.liquidity);
         logger.info('Successfully removed liquidity from old position', {
           positionId: position.positionId,
+          amountA: closedPositionAmounts.amountA,
+          amountB: closedPositionAmounts.amountB,
         });
       } else {
         logger.info('Position has no liquidity - skipping removal step');
@@ -224,7 +230,9 @@ export class RebalanceService {
       }
 
       // Add liquidity to existing in-range position or create a new one.
-      // The zap method uses available wallet balances directly — no pre-swaps needed.
+      // When closedPositionAmounts are available the zap uses the freed token
+      // amounts rather than the full wallet balance, so the new position
+      // receives exactly the liquidity that was released from the old one.
       let result;
       try {
         result = await this.addLiquidity(
@@ -232,6 +240,7 @@ export class RebalanceService {
           lower,
           upper,
           existingInRangePosition?.positionId,
+          closedPositionAmounts,
         );
       } catch (addLiquidityError) {
         // Add liquidity failed - if we cleared tracking, keep it cleared so bot can recover
@@ -333,7 +342,7 @@ export class RebalanceService {
     }
   }
 
-  private async removeLiquidity(positionId: string, liquidity: string): Promise<void> {
+  private async removeLiquidity(positionId: string, liquidity: string): Promise<{ amountA: string; amountB: string }> {
     try {
       logger.info('Removing liquidity', { positionId, liquidity });
 
@@ -341,6 +350,10 @@ export class RebalanceService {
       const keypair = this.sdkService.getKeypair();
       const suiClient = this.sdkService.getSuiClient();
       const ownerAddress = this.sdkService.getAddress();
+
+      // Track coin types so we can parse balance changes after the transaction
+      let coinTypeA = '';
+      let coinTypeB = '';
 
       // Execute remove liquidity with retry logic
       logger.info('Executing remove liquidity transaction');
@@ -353,6 +366,9 @@ export class RebalanceService {
           if (!position) {
             throw new Error(`Position ${positionId} not found`);
           }
+
+          coinTypeA = position.tokenA;
+          coinTypeB = position.tokenB;
 
           // Build remove liquidity transaction payload with fresh position data
           const params: RemoveLiquidityParams = {
@@ -376,6 +392,7 @@ export class RebalanceService {
             options: {
               showEffects: true,
               showEvents: true,
+              showBalanceChanges: true,
             },
           });
 
@@ -390,10 +407,41 @@ export class RebalanceService {
         2000
       );
 
+      // Parse balance changes to determine how many tokens were returned to the wallet.
+      // A positive balance change for the owner address means tokens were received.
+      const normalizeCoinType = (ct: string) => ct.toLowerCase().replace(/^0x0+/, '0x');
+      const normalizedTypeA = normalizeCoinType(coinTypeA);
+      const normalizedTypeB = normalizeCoinType(coinTypeB);
+
+      let amountA = '0';
+      let amountB = '0';
+
+      const balanceChanges: BalanceChange[] | null | undefined = result.balanceChanges;
+
+      if (balanceChanges) {
+        for (const change of balanceChanges) {
+          const owner = change.owner;
+          if (typeof owner !== 'object' || !('AddressOwner' in owner)) continue;
+          if ((owner as { AddressOwner: string }).AddressOwner.toLowerCase() !== ownerAddress.toLowerCase()) continue;
+          const amt = BigInt(change.amount);
+          if (amt <= 0n) continue;
+          const normalizedType = normalizeCoinType(change.coinType);
+          if (normalizedType === normalizedTypeA) {
+            amountA = amt.toString();
+          } else if (normalizedType === normalizedTypeB) {
+            amountB = amt.toString();
+          }
+        }
+      }
+
       logger.info('Liquidity removed successfully', {
         digest: result.digest,
         gasUsed: result.effects?.gasUsed,
+        amountA,
+        amountB,
       });
+
+      return { amountA, amountB };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
@@ -553,11 +601,32 @@ export class RebalanceService {
   }
 
   /**
-   * Add liquidity using the SDK's fix-token (zap) method.
+   * Calculate the amount to use for a single token in the zap call when
+   * rebalancing from a closed position.
    *
-   * This method provides available wallet balances directly to
-   * createAddLiquidityFixTokenPayload and lets the SDK compute the correct
-   * proportional amounts — no manual pre-swaps are required:
+   * @param removedAmount - token amount received from closing the old position
+   * @param safeBalance   - current wallet balance after reserving gas
+   * @returns amount to pass to the SDK (as a string)
+   */
+  private calculateZapAmount(removedAmount: bigint, safeBalance: bigint): string {
+    if (removedAmount <= 0n) return '0';
+    return (removedAmount <= safeBalance ? removedAmount : safeBalance).toString();
+  }
+
+   /**
+    * Add liquidity using the SDK's fix-token (zap) method.
+    *
+    * When closedPositionAmounts are provided (rebalancing case) the method uses
+   * those freed token amounts as the zap inputs instead of the full wallet
+   * balance.  This ensures the new position is funded exclusively by the
+   * liquidity that was released from the closed out-of-range position:
+   *
+   *  - Freed amount > 0 and ≤ safe wallet balance → use the freed amount
+   *  - Freed amount > safe wallet balance          → cap to safe wallet balance
+   *  - Freed amount is 0 / undefined               → use 0 (not wallet balance)
+   *
+   * When no closedPositionAmounts are given (new position from scratch) the
+   * original wallet-balance logic applies:
    *
    *  - Position below range  → only token A needed; amount_b = 0
    *  - Position above range  → only token B needed; amount_a = 0
@@ -568,6 +637,7 @@ export class RebalanceService {
     tickLower: number,
     tickUpper: number,
     existingPositionId?: string,
+    closedPositionAmounts?: { amountA: string; amountB: string },
   ): Promise<{ transactionDigest?: string }> {
     try {
       logger.info('Adding liquidity using zap method', {
@@ -626,12 +696,22 @@ export class RebalanceService {
         priceIsAboveRange,
       });
 
-      // Zap method: provide the token(s) that the position range actually needs.
-      // The SDK calculates the exact proportional amounts from the fixed token.
+      // Select token amounts for the zap call.
       let amountA: string;
       let amountB: string;
 
-      if (priceIsBelowRange) {
+      if (closedPositionAmounts) {
+        // Rebalancing: use only the tokens freed from the closed position.
+        // Cap each amount at the safe wallet balance in case gas consumed some SUI.
+        amountA = this.calculateZapAmount(BigInt(closedPositionAmounts.amountA), safeBalanceA);
+        amountB = this.calculateZapAmount(BigInt(closedPositionAmounts.amountB), safeBalanceB);
+        logger.info('Using closed position token amounts for zap', {
+          removedA: closedPositionAmounts.amountA,
+          removedB: closedPositionAmounts.amountB,
+          amountA,
+          amountB,
+        });
+      } else if (priceIsBelowRange) {
         // Only token A is needed for a below-range position
         amountA = safeBalanceA.toString();
         amountB = '0';
