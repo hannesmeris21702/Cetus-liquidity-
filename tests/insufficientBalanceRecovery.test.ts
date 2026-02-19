@@ -31,6 +31,7 @@ const mockLogger = {
 function isInsufficientBalanceError(errorMsg: string): boolean {
   const insufficientPatterns = [
     /insufficient balance/i,
+    /insufficientcoinbalance/i, // Matches "InsufficientCoinBalance" error from transactions
     /expect\s+\d+/i, // More specific: matches "expect <number>" pattern
     /amount is insufficient/i,
   ];
@@ -91,6 +92,19 @@ async function runTests() {
     assert.ok(isInsufficientBalanceError(error3), 'Should detect "amount is insufficient" (lowercase)');
     
     console.log('✔ Detects "amount is Insufficient" error pattern');
+  }
+
+  // Test 4.5: Detect "InsufficientCoinBalance" error from transactions
+  {
+    const error1 = 'Failed to add liquidity: InsufficientCoinBalance in command 1';
+    const error2 = 'Transaction failed: InsufficientCoinBalance';
+    const error3 = 'Error: insufficientcoinbalance detected';
+    
+    assert.ok(isInsufficientBalanceError(error1), 'Should detect "InsufficientCoinBalance" from transaction error');
+    assert.ok(isInsufficientBalanceError(error2), 'Should detect "InsufficientCoinBalance" standalone');
+    assert.ok(isInsufficientBalanceError(error3), 'Should detect "insufficientcoinbalance" (lowercase)');
+    
+    console.log('✔ Detects "InsufficientCoinBalance" transaction error pattern');
   }
 
   // Test 5: Should NOT detect unrelated errors
