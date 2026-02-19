@@ -610,6 +610,11 @@ export class RebalanceService {
    */
   private calculateZapAmount(removedAmount: bigint, safeBalance: bigint): string {
     if (removedAmount <= 0n) return '0';
+    // If the balance query returned 0 but we received a positive amount from
+    // closing the position, the on-chain state may not yet be reflected in the
+    // balance RPC response.  Trust the closed-position amount so the zap can
+    // proceed with the tokens that were just returned to the wallet.
+    if (safeBalance === 0n) return removedAmount.toString();
     return (removedAmount <= safeBalance ? removedAmount : safeBalance).toString();
   }
 
@@ -678,7 +683,15 @@ export class RebalanceService {
       });
 
       if (safeBalanceA === 0n && safeBalanceB === 0n) {
-        throw new Error('No tokens available to add liquidity. Please ensure wallet has sufficient balance.');
+        // When rebalancing, tokens come from the just-closed position and the
+        // balance RPC may not yet reflect the completed transaction.  Skip this
+        // guard if we have non-zero closed-position amounts to work with.
+        const hasClosedAmounts =
+          closedPositionAmounts &&
+          (BigInt(closedPositionAmounts.amountA) > 0n || BigInt(closedPositionAmounts.amountB) > 0n);
+        if (!hasClosedAmounts) {
+          throw new Error('No tokens available to add liquidity. Please ensure wallet has sufficient balance.');
+        }
       }
 
       // Fetch current pool state to determine position range
