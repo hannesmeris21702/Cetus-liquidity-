@@ -4,6 +4,7 @@ import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
 import type { BalanceChange } from '@mysten/sui/client';
+import type { SwapParams } from '@cetusprotocol/cetus-sui-clmm-sdk';
 
 export interface RebalanceResult {
   success: boolean;
@@ -54,6 +55,9 @@ export class RebalanceService {
   private config: BotConfig;
   private dryRun: boolean;
   private trackedPositionId: string | null;
+
+  // Scale factor for bigint slippage arithmetic (basis points denominator).
+  private static readonly SLIPPAGE_SCALE = 10_000n;
 
   constructor(
     sdkService: CetusSDKService,
@@ -409,9 +413,8 @@ export class RebalanceService {
 
       // Parse balance changes to determine how many tokens were returned to the wallet.
       // A positive balance change for the owner address means tokens were received.
-      const normalizeCoinType = (ct: string) => ct.toLowerCase().replace(/^0x0+/, '0x');
-      const normalizedTypeA = normalizeCoinType(coinTypeA);
-      const normalizedTypeB = normalizeCoinType(coinTypeB);
+      const normalizedTypeA = this.normalizeCoinType(coinTypeA);
+      const normalizedTypeB = this.normalizeCoinType(coinTypeB);
 
       let amountA = '0';
       let amountB = '0';
@@ -425,7 +428,7 @@ export class RebalanceService {
           if ((owner as { AddressOwner: string }).AddressOwner.toLowerCase() !== ownerAddress.toLowerCase()) continue;
           const amt = BigInt(change.amount);
           if (amt <= 0n) continue;
-          const normalizedType = normalizeCoinType(change.coinType);
+          const normalizedType = this.normalizeCoinType(change.coinType);
           if (normalizedType === normalizedTypeA) {
             amountA = amt.toString();
           } else if (normalizedType === normalizedTypeB) {
@@ -565,6 +568,11 @@ export class RebalanceService {
     throw lastError || new Error('Add liquidity failed with unknown error');
   }
 
+  /** Normalise a coin type string for comparison (lowercased, leading zeros stripped). */
+  private normalizeCoinType(ct: string): string {
+    return ct.toLowerCase().replace(/^0x0+/, '0x');
+  }
+
   /**
    * Determine which token amount to fix when calling createAddLiquidityFixTokenPayload.
    *
@@ -618,6 +626,138 @@ export class RebalanceService {
     return (removedAmount <= safeBalance ? removedAmount : safeBalance).toString();
   }
 
+  /**
+   * Perform a swap of approximately half of a single-token balance so that
+   * both tokens are available for adding to an in-range position (zap in).
+   *
+   * @param poolInfo   - pool metadata
+   * @param aToB       - true = swap tokenA → tokenB, false = swap tokenB → tokenA
+   * @param swapAmount - raw amount of the input token to swap (≈ half of total)
+   * @param preSwapA   - tokenA amount BEFORE the swap (for post-swap calculation)
+   * @param preSwapB   - tokenB amount BEFORE the swap (for post-swap calculation)
+   * @returns updated { amountA, amountB } to use for the addLiquidity call
+   */
+  private async performZapInSwap(
+    poolInfo: PoolInfo,
+    aToB: boolean,
+    swapAmount: bigint,
+    preSwapA: bigint,
+    preSwapB: bigint,
+  ): Promise<{ amountA: string; amountB: string }> {
+    const sdk = this.sdkService.getSdk();
+    const keypair = this.sdkService.getKeypair();
+    const suiClient = this.sdkService.getSuiClient();
+    const ownerAddress = this.sdkService.getAddress();
+
+    logger.info('Zap-in: performing pre-swap to obtain both tokens', {
+      aToB,
+      swapAmount: swapAmount.toString(),
+    });
+
+    // Estimate the swap output to set a meaningful amount_limit (min out with slippage).
+    let amountLimit = '0';
+    try {
+      const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+      const preswapResult = await sdk.Swap.preswap({
+        pool,
+        currentSqrtPrice: pool.current_sqrt_price,
+        coinTypeA: poolInfo.coinTypeA,
+        coinTypeB: poolInfo.coinTypeB,
+        decimalsA: 9,
+        decimalsB: 9,
+        a2b: aToB,
+        byAmountIn: true,
+        amount: swapAmount.toString(),
+      });
+      if (preswapResult && !preswapResult.isExceed) {
+        const estimatedOut = BigInt(preswapResult.estimatedAmountOut);
+        // Apply slippage tolerance to get the minimum acceptable output.
+        const slippageFactor = BigInt(Math.floor((1 - this.config.maxSlippage) * Number(RebalanceService.SLIPPAGE_SCALE)));
+        amountLimit = ((estimatedOut * slippageFactor) / RebalanceService.SLIPPAGE_SCALE).toString();
+        logger.info('Zap-in swap estimate', {
+          estimatedAmountOut: preswapResult.estimatedAmountOut,
+          amountLimit,
+        });
+      }
+    } catch (err) {
+      logger.warn('Zap-in preswap estimate failed — proceeding with amount_limit=0', { error: err });
+    }
+
+    // Build and execute the swap transaction.
+    const swapParams: SwapParams = {
+      pool_id: poolInfo.poolAddress,
+      coinTypeA: poolInfo.coinTypeA,
+      coinTypeB: poolInfo.coinTypeB,
+      a2b: aToB,
+      by_amount_in: true,
+      amount: swapAmount.toString(),
+      amount_limit: amountLimit,
+    };
+
+    const swapPayload = await sdk.Swap.createSwapTransactionPayload(swapParams);
+    swapPayload.setGasBudget(this.config.gasBudget);
+
+    const swapResult = await suiClient.signAndExecuteTransaction({
+      transaction: swapPayload,
+      signer: keypair,
+      options: { showEffects: true, showBalanceChanges: true },
+    });
+
+    if (swapResult.effects?.status?.status !== 'success') {
+      throw new Error(`Zap-in swap failed: ${swapResult.effects?.status?.error || 'Unknown error'}`);
+    }
+
+    logger.info('Zap-in swap executed', { digest: swapResult.digest });
+
+    // Derive post-swap amounts from balance changes reported by the transaction.
+    // Falls back to re-querying the wallet if the balance changes cannot be parsed.
+    const SUI_GAS_RESERVE = BigInt(this.config.gasBudget);
+    const SUI_TYPE = '0x2::sui::SUI';
+    const SUI_TYPE_FULL = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
+    const isSuiCoinType = (ct: string) => ct === SUI_TYPE || ct === SUI_TYPE_FULL;
+
+    const normalizedTypeA = this.normalizeCoinType(poolInfo.coinTypeA);
+    const normalizedTypeB = this.normalizeCoinType(poolInfo.coinTypeB);
+
+    let swapDeltaA = 0n;
+    let swapDeltaB = 0n;
+    const balanceChanges: BalanceChange[] | null | undefined = swapResult.balanceChanges;
+    if (balanceChanges) {
+      for (const change of balanceChanges) {
+        const owner = change.owner;
+        if (typeof owner !== 'object' || !('AddressOwner' in owner)) continue;
+        if ((owner as { AddressOwner: string }).AddressOwner.toLowerCase() !== ownerAddress.toLowerCase()) continue;
+        const normalizedType = this.normalizeCoinType(change.coinType);
+        if (normalizedType === normalizedTypeA) swapDeltaA += BigInt(change.amount);
+        else if (normalizedType === normalizedTypeB) swapDeltaB += BigInt(change.amount);
+      }
+    }
+
+    let adjA = preSwapA + swapDeltaA;
+    let adjB = preSwapB + swapDeltaB;
+
+    // If balance changes didn't give usable deltas, re-query the wallet.
+    if (adjA <= 0n && adjB <= 0n) {
+      logger.warn('Zap-in swap: balance change parsing yielded 0 — re-querying wallet balances');
+      const [balA, balB] = await Promise.all([
+        suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
+        suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
+      ]);
+      adjA = BigInt(balA.totalBalance);
+      adjB = BigInt(balB.totalBalance);
+    }
+
+    // Reserve gas when a token is SUI.
+    if (isSuiCoinType(poolInfo.coinTypeA) && adjA > SUI_GAS_RESERVE) adjA -= SUI_GAS_RESERVE;
+    if (isSuiCoinType(poolInfo.coinTypeB) && adjB > SUI_GAS_RESERVE) adjB -= SUI_GAS_RESERVE;
+
+    const amountA = (adjA > 0n ? adjA : 0n).toString();
+    const amountB = (adjB > 0n ? adjB : 0n).toString();
+
+    logger.info('Zap-in swap complete — updated token amounts', { amountA, amountB });
+    return { amountA, amountB };
+  }
+
    /**
     * Add liquidity using the SDK's fix-token (zap) method.
     *
@@ -636,6 +776,10 @@ export class RebalanceService {
    *  - Position below range  → only token A needed; amount_b = 0
    *  - Position above range  → only token B needed; amount_a = 0
    *  - Position in range     → provide both tokens; SDK calculates ratio from the fixed token
+   *
+   * Zap-in: When an in-range position has only one token available (e.g. because
+   * the old position was single-sided), the method automatically swaps half of
+   * the available token to obtain both tokens before adding liquidity.
    */
   private async addLiquidity(
     poolInfo: PoolInfo,
@@ -763,6 +907,30 @@ export class RebalanceService {
 
       if (BigInt(amountA) === 0n && BigInt(amountB) === 0n) {
         throw new Error('Insufficient token balance for this position range. Please add tokens to your wallet.');
+      }
+
+      // Zap-in: when the new position is in-range but we only have one token,
+      // swap approximately half of it so both tokens are available for the
+      // add-liquidity call.  This is the core "zap in" behaviour.
+      if (!priceIsBelowRange && !priceIsAboveRange) {
+        const bigAmountA = BigInt(amountA);
+        const bigAmountB = BigInt(amountB);
+        const oneIsZero =
+          (bigAmountA > 0n && bigAmountB === 0n) ||
+          (bigAmountA === 0n && bigAmountB > 0n);
+
+        if (oneIsZero) {
+          const aToB = bigAmountA > 0n;
+          const swapAmount = (aToB ? bigAmountA : bigAmountB) / 2n;
+
+          if (swapAmount > 0n) {
+            const updated = await this.performZapInSwap(
+              poolInfo, aToB, swapAmount, bigAmountA, bigAmountB,
+            );
+            amountA = updated.amountA;
+            amountB = updated.amountB;
+          }
+        }
       }
 
       const isOpen = !existingPositionId;
