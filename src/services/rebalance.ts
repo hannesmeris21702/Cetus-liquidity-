@@ -774,7 +774,9 @@ export class RebalanceService {
     requestedAmountA: string,
     requestedAmountB: string,
     ownerAddress: string,
-    suiClient: any
+    suiClient: any,
+    preservedRequiredA?: string,
+    preservedRequiredB?: string
   ): Promise<void> {
     try {
       logger.info('Analyzing insufficient balance error...', { error: errorMsg });
@@ -793,8 +795,12 @@ export class RebalanceService {
       
       const currentBalanceA = BigInt(balanceA.totalBalance);
       const currentBalanceB = BigInt(balanceB.totalBalance);
-      const requiredA = BigInt(requestedAmountA);
-      const requiredB = BigInt(requestedAmountB);
+      // Use preserved (pre-cap) required amounts when available so we can
+      // correctly detect which token is short relative to the target liquidity.
+      // The requestedAmountA/B are already capped to balance, so comparing them
+      // directly would never reveal an insufficiency.
+      const requiredA = BigInt(preservedRequiredA ?? requestedAmountA);
+      const requiredB = BigInt(preservedRequiredB ?? requestedAmountB);
       
       logger.info('Balance analysis:', {
         currentBalanceA: currentBalanceA.toString(),
@@ -1389,13 +1395,27 @@ export class RebalanceService {
       
       // Determine which token to fix based on available amounts and position range.
       // For out-of-range positions: fix the non-zero token so the SDK can compute the required counterpart (typically 0).
-      // For in-range positions: fix the smaller amount to ensure both tokens can be fully utilized.
-      //   - Fixing the smaller amount ensures the SDK's calculated requirement for the larger token
-      //     won't exceed what we have available, maximizing liquidity provision with both tokens.
+      // For in-range positions: choose the fix direction that keeps the SDK-computed counterpart
+      //   within the available balance.  When the pool ratio is skewed, fixing the smaller token
+      //   can cause the SDK to compute a counterpart requirement that exceeds what we hold; in
+      //   that case we must fix the other token instead.
       let fixAmountA: boolean;
       if (priceIsInRange && BigInt(amountA) > 0n && BigInt(amountB) > 0n) {
-        // In-range position with both tokens: fix the smaller amount
-        fixAmountA = BigInt(amountA) <= BigInt(amountB);
+        if (preservedAmounts) {
+          const rA = BigInt(preservedAmounts.amountA);
+          const rB = BigInt(preservedAmounts.amountB);
+          if (rA > 0n && rB > 0n) {
+            // If we fix A, the SDK will compute neededB = amountA * rB / rA.
+            // Only fix A when that computed B stays within our available amountB.
+            const neededBIfFixA = (BigInt(amountA) * rB) / rA;
+            fixAmountA = neededBIfFixA <= BigInt(amountB);
+          } else {
+            fixAmountA = BigInt(amountA) <= BigInt(amountB);
+          }
+        } else {
+          // In-range position with both tokens and no preserved ratio: fix the smaller amount
+          fixAmountA = BigInt(amountA) <= BigInt(amountB);
+        }
       } else {
         // Out-of-range position or one token is 0: fix the larger/non-zero amount
         fixAmountA = BigInt(amountA) >= BigInt(amountB);
@@ -1498,7 +1518,9 @@ export class RebalanceService {
                   amountA,
                   amountB,
                   ownerAddress,
-                  suiClient
+                  suiClient,
+                  preservedAmounts?.amountA,
+                  preservedAmounts?.amountB
                 );
                 
                 // After swap, retry the add liquidity operation once
