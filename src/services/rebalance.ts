@@ -431,11 +431,15 @@ export class RebalanceService {
       // Save the old tracked position ID and clear tracking before attempting add liquidity
       // This prevents the bot from tracking a position with zero liquidity if add liquidity fails
       const oldTrackedPositionId = this.trackedPositionId;
-      if (!existingInRangePosition && hasLiquidity) {
+      const isCreatingNewPosition = !existingInRangePosition && hasLiquidity;
+      
+      if (isCreatingNewPosition) {
         // We're creating a new position and removed liquidity from old one
         // Clear tracking temporarily until we confirm the new position is created
         this.trackedPositionId = null;
-        logger.info('Cleared tracked position ID - will update after successful add liquidity');
+        logger.info('Cleared tracked position ID - will update after successful add liquidity', {
+          oldPositionId: oldTrackedPositionId,
+        });
       }
 
       // Add liquidity to existing in-range position or create a new one
@@ -451,8 +455,13 @@ export class RebalanceService {
         );
       } catch (addLiquidityError) {
         // Add liquidity failed - if we cleared tracking, keep it cleared so bot can recover
-        if (!existingInRangePosition && hasLiquidity) {
-          logger.warn('Add liquidity failed after removing liquidity from tracked position. Tracking cleared to allow recovery.');
+        // We don't restore oldTrackedPositionId because that position now has zero liquidity
+        // and would be filtered out in subsequent checks. Keeping it null allows auto-tracking.
+        if (isCreatingNewPosition) {
+          logger.warn('Add liquidity failed after removing liquidity from tracked position. Tracking cleared to allow recovery.', {
+            oldPositionId: oldTrackedPositionId,
+            reason: 'Old position has zero liquidity and would be filtered out',
+          });
         }
         throw addLiquidityError;
       }
@@ -472,10 +481,18 @@ export class RebalanceService {
             this.trackedPositionId = newPos.positionId;
             logger.info('Now tracking newly created position', { positionId: newPos.positionId });
           } else {
-            logger.warn('Could not find newly created position. Tracking will remain cleared.');
+            // Couldn't find new position - keep tracking cleared (null)
+            // Don't restore oldTrackedPositionId because it has zero liquidity
+            logger.warn('Could not find newly created position. Tracking will remain cleared.', {
+              oldPositionId: oldTrackedPositionId,
+              reason: 'Will allow auto-tracking in next cycle',
+            });
           }
         } catch (err) {
-          logger.warn('Could not discover new position ID after rebalance', err);
+          logger.warn('Could not discover new position ID after rebalance', {
+            error: err,
+            oldPositionId: oldTrackedPositionId,
+          });
           // Keep tracking cleared if we couldn't discover the new position
         }
       }
