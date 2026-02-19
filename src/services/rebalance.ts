@@ -1051,6 +1051,110 @@ export class RebalanceService {
         throw error;
       }
 
+      // Get current pool price to determine which token the new position will need
+      const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+      const currentTickIndex = pool.current_tick_index;
+      
+      // Determine which token(s) the new tick range will require based on current price
+      // If current price is below the range: position only needs token A
+      // If current price is above the range: position only needs token B
+      // If current price is within the range: position needs both tokens
+      const priceIsBelowRange = currentTickIndex < tickLower;
+      const priceIsAboveRange = currentTickIndex >= tickUpper;
+      const priceIsInRange = !priceIsBelowRange && !priceIsAboveRange;
+      
+      logger.info('Position range relative to current price', {
+        currentTickIndex,
+        tickLower,
+        tickUpper,
+        priceIsBelowRange,
+        priceIsInRange,
+        priceIsAboveRange,
+      });
+      
+      // Check if we need to swap tokens before adding liquidity
+      // This is critical when moving between out-of-range positions in opposite directions
+      if (preservedAmounts && (priceIsBelowRange || priceIsAboveRange)) {
+        const finalAmountABigInt = BigInt(amountA);
+        const finalAmountBBigInt = BigInt(amountB);
+        
+        if (priceIsBelowRange && finalAmountABigInt === 0n && finalAmountBBigInt > 0n) {
+          // New position needs only token A, but we only have token B - need to swap B→A
+          logger.info('Position is out-of-range (below) and requires token A, but we only have token B. Swapping...');
+          
+          try {
+            // Swap all available token B to token A
+            await this.performSwap(poolInfo, false, amountB);
+            
+            // Refetch balances after swap
+            const swappedBalances = await Promise.all([
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeA,
+              }),
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeB,
+              }),
+            ]);
+            
+            const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
+            const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
+            const swappedSafeBalanceA = isSuiA && swappedBalanceA > SUI_GAS_RESERVE
+              ? swappedBalanceA - SUI_GAS_RESERVE
+              : swappedBalanceA;
+            const swappedSafeBalanceB = isSuiB && swappedBalanceB > SUI_GAS_RESERVE
+              ? swappedBalanceB - SUI_GAS_RESERVE
+              : swappedBalanceB;
+            
+            amountA = swappedSafeBalanceA.toString();
+            amountB = swappedSafeBalanceB.toString();
+            
+            logger.info('Amounts after B→A swap for out-of-range position', { amountA, amountB });
+          } catch (swapError) {
+            logger.error('Failed to swap B→A for out-of-range position', swapError);
+            throw new Error(`Cannot add liquidity: position requires token A but only have token B, and swap failed: ${swapError instanceof Error ? swapError.message : String(swapError)}`);
+          }
+        } else if (priceIsAboveRange && finalAmountBBigInt === 0n && finalAmountABigInt > 0n) {
+          // New position needs only token B, but we only have token A - need to swap A→B
+          logger.info('Position is out-of-range (above) and requires token B, but we only have token A. Swapping...');
+          
+          try {
+            // Swap all available token A to token B
+            await this.performSwap(poolInfo, true, amountA);
+            
+            // Refetch balances after swap
+            const swappedBalances = await Promise.all([
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeA,
+              }),
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeB,
+              }),
+            ]);
+            
+            const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
+            const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
+            const swappedSafeBalanceA = isSuiA && swappedBalanceA > SUI_GAS_RESERVE
+              ? swappedBalanceA - SUI_GAS_RESERVE
+              : swappedBalanceA;
+            const swappedSafeBalanceB = isSuiB && swappedBalanceB > SUI_GAS_RESERVE
+              ? swappedBalanceB - SUI_GAS_RESERVE
+              : swappedBalanceB;
+            
+            amountA = swappedSafeBalanceA.toString();
+            amountB = swappedSafeBalanceB.toString();
+            
+            logger.info('Amounts after A→B swap for out-of-range position', { amountA, amountB });
+          } catch (swapError) {
+            logger.error('Failed to swap A→B for out-of-range position', swapError);
+            throw new Error(`Cannot add liquidity: position requires token B but only have token A, and swap failed: ${swapError instanceof Error ? swapError.message : String(swapError)}`);
+          }
+        }
+      }
+      
       // Determine which token to fix based on available amounts.
       // When one amount is 0 (common for out-of-range positions), this ensures
       // we fix the non-zero token so the SDK can compute the required counterpart.
