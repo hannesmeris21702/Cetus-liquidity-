@@ -1394,13 +1394,27 @@ export class RebalanceService {
       }
       
       // Determine which token to fix based on available amounts and position range.
-      // For out-of-range positions: fix the non-zero token so the SDK can compute the required counterpart (typically 0).
-      // For in-range positions: choose the fix direction that keeps the SDK-computed counterpart
-      //   within the available balance.  When the pool ratio is skewed, fixing the smaller token
-      //   can cause the SDK to compute a counterpart requirement that exceeds what we hold; in
-      //   that case we must fix the other token instead.
+      //
+      // IMPORTANT: The Cetus CLMM Move contract's get_liquidity_by_amount function
+      // REQUIRES a specific fix_amount_a value depending on where the current price is
+      // relative to the tick range:
+      //   - Price BELOW range (currentTick < tickLower): fix_amount_a MUST be true
+      //   - Price ABOVE range (currentTick >= tickUpper): fix_amount_a MUST be false
+      //   - Price IN range: either value is valid; pick the one that fits our balance
+      // Violating this constraint causes MoveAbort error 3018 from get_liquidity_by_amount.
+      //
+      // Note: We use the price fetched above, but on each retry we also refresh fix_amount_a
+      // via addLiquidityParams to handle price movement between attempts.
       let fixAmountA: boolean;
-      if (priceIsInRange && BigInt(amountA) > 0n && BigInt(amountB) > 0n) {
+      if (priceIsBelowRange) {
+        // Price is below range: only token A is needed; fix_amount_a MUST be true
+        fixAmountA = true;
+      } else if (priceIsAboveRange) {
+        // Price is above range: only token B is needed; fix_amount_a MUST be false
+        fixAmountA = false;
+      } else if (BigInt(amountA) > 0n && BigInt(amountB) > 0n) {
+        // In-range with both tokens available: choose the fix direction that keeps the
+        // SDK-computed counterpart within the available balance.
         if (preservedAmounts) {
           const rA = BigInt(preservedAmounts.amountA);
           const rB = BigInt(preservedAmounts.amountB);
@@ -1417,8 +1431,8 @@ export class RebalanceService {
           fixAmountA = BigInt(amountA) <= BigInt(amountB);
         }
       } else {
-        // Out-of-range position or one token is 0: fix the larger/non-zero amount
-        fixAmountA = BigInt(amountA) >= BigInt(amountB);
+        // In-range with one token = 0: fix the non-zero token
+        fixAmountA = BigInt(amountA) > 0n;
       }
 
       // Determine whether we need to open a new position or add to an existing one.
@@ -1477,6 +1491,20 @@ export class RebalanceService {
             // Refetch pool state on each retry to get latest version
             const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
             const currentSqrtPrice = new BN(pool.current_sqrt_price);
+            
+            // Recompute fix_amount_a based on the CURRENT tick index so that price
+            // movements between retries don't violate the Cetus CLMM contract constraint:
+            //   price < tickLower  → fix_amount_a MUST be true
+            //   price >= tickUpper → fix_amount_a MUST be false
+            const retryTickIndex = pool.current_tick_index;
+            const retryPriceBelow = retryTickIndex < tickLower;
+            const retryPriceAbove = retryTickIndex >= tickUpper;
+            if (retryPriceBelow) {
+              addLiquidityParams.fix_amount_a = true;
+            } else if (retryPriceAbove) {
+              addLiquidityParams.fix_amount_a = false;
+            }
+            // For in-range retries, keep the previously computed fixAmountA value.
             
             try {
               // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
