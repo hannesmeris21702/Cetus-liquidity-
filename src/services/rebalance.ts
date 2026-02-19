@@ -295,18 +295,19 @@ export class RebalanceService {
         const balanceAfterA = BigInt(balancesAfter[0].totalBalance);
         const balanceAfterB = BigInt(balancesAfter[1].totalBalance);
         
-        // Calculate the actual amounts received from removing liquidity
+        // Calculate the actual amounts received from removing liquidity (for logging)
         const removedAmountA = balanceAfterA - balanceBeforeA;
         const removedAmountB = balanceAfterB - balanceBeforeB;
         
         logger.info('Successfully removed liquidity from old position', {
           positionId: position.positionId,
-          removedAmountA: removedAmountA.toString(),
-          removedAmountB: removedAmountB.toString(),
+          actualRemovedAmountA: removedAmountA.toString(),
+          actualRemovedAmountB: removedAmountB.toString(),
         });
         
         // Calculate the required token amounts for the new position based on the liquidity parameter
         // This preserves the liquidity amount (L) when moving to a new tick range
+        // Note: removedTokenAmounts below contains REQUIRED amounts, not the actual removed amounts
         const sdk = this.sdkService.getSdk();
         const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
         removedTokenAmounts = this.calculateTokenAmountsFromLiquidity(
