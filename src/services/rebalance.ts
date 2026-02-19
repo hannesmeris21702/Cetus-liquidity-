@@ -1075,15 +1075,15 @@ export class RebalanceService {
       // Check if we need to swap tokens before adding liquidity
       // This is critical when moving between out-of-range positions in opposite directions
       if (preservedAmounts && (priceIsBelowRange || priceIsAboveRange)) {
-        const finalAmountABigInt = BigInt(amountA);
-        const finalAmountBBigInt = BigInt(amountB);
+        const currentAmountABigInt = BigInt(amountA);
+        const currentAmountBBigInt = BigInt(amountB);
         
-        if (priceIsBelowRange && finalAmountABigInt === 0n && finalAmountBBigInt > 0n) {
+        if (priceIsBelowRange && currentAmountABigInt === 0n && currentAmountBBigInt > 0n) {
           // New position needs only token A, but we only have token B - need to swap B→A
           logger.info('Position is out-of-range (below) and requires token A, but we only have token B. Swapping...');
           
           try {
-            // Swap all available token B to token A
+            // Swap all available token B to token A (false = B→A direction)
             await this.performSwap(poolInfo, false, amountB);
             
             // Refetch balances after swap
@@ -1098,6 +1098,7 @@ export class RebalanceService {
               }),
             ]);
             
+            // Calculate safe balances (reserve gas if token is SUI)
             const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
             const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
             const swappedSafeBalanceA = isSuiA && swappedBalanceA > SUI_GAS_RESERVE
@@ -1115,12 +1116,12 @@ export class RebalanceService {
             logger.error('Failed to swap B→A for out-of-range position', swapError);
             throw new Error(`Cannot add liquidity: position requires token A but only have token B, and swap failed: ${swapError instanceof Error ? swapError.message : String(swapError)}`);
           }
-        } else if (priceIsAboveRange && finalAmountBBigInt === 0n && finalAmountABigInt > 0n) {
+        } else if (priceIsAboveRange && currentAmountBBigInt === 0n && currentAmountABigInt > 0n) {
           // New position needs only token B, but we only have token A - need to swap A→B
           logger.info('Position is out-of-range (above) and requires token B, but we only have token A. Swapping...');
           
           try {
-            // Swap all available token A to token B
+            // Swap all available token A to token B (true = A→B direction)
             await this.performSwap(poolInfo, true, amountA);
             
             // Refetch balances after swap
@@ -1135,6 +1136,7 @@ export class RebalanceService {
               }),
             ]);
             
+            // Calculate safe balances (reserve gas if token is SUI)
             const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
             const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
             const swappedSafeBalanceA = isSuiA && swappedBalanceA > SUI_GAS_RESERVE
