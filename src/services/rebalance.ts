@@ -1168,6 +1168,8 @@ export class RebalanceService {
             
             try {
               // Swap approximately half of token B to get token A (false = B→A direction)
+              // Note: Using 50/50 split as a simple approximation. The SDK will calculate
+              // the exact token ratio needed for the position range during add liquidity.
               const swapAmountB = currentAmountBBigInt / 2n;
               await this.performSwap(poolInfo, false, swapAmountB.toString());
               
@@ -1207,6 +1209,8 @@ export class RebalanceService {
             
             try {
               // Swap approximately half of token A to get token B (true = A→B direction)
+              // Note: Using 50/50 split as a simple approximation. The SDK will calculate
+              // the exact token ratio needed for the position range during add liquidity.
               const swapAmountA = currentAmountABigInt / 2n;
               await this.performSwap(poolInfo, true, swapAmountA.toString());
               
