@@ -714,16 +714,38 @@ export class RebalanceService {
       let amountB: string;
 
       if (closedPositionAmounts) {
-        // Rebalancing: use only the tokens freed from the closed position.
-        // Cap each amount at the safe wallet balance in case gas consumed some SUI.
-        amountA = this.calculateZapAmount(BigInt(closedPositionAmounts.amountA), safeBalanceA);
-        amountB = this.calculateZapAmount(BigInt(closedPositionAmounts.amountB), safeBalanceB);
-        logger.info('Using closed position token amounts for zap', {
-          removedA: closedPositionAmounts.amountA,
-          removedB: closedPositionAmounts.amountB,
-          amountA,
-          amountB,
-        });
+        const removedA = BigInt(closedPositionAmounts.amountA);
+        const removedB = BigInt(closedPositionAmounts.amountB);
+        if (removedA > 0n || removedB > 0n) {
+          // Rebalancing: use only the tokens freed from the closed position.
+          // Cap each amount at the safe wallet balance in case gas consumed some SUI.
+          amountA = this.calculateZapAmount(removedA, safeBalanceA);
+          amountB = this.calculateZapAmount(removedB, safeBalanceB);
+          logger.info('Using closed position token amounts for zap', {
+            removedA: closedPositionAmounts.amountA,
+            removedB: closedPositionAmounts.amountB,
+            amountA,
+            amountB,
+          });
+        } else {
+          // Balance change parsing returned 0 for both tokens (e.g. net SUI change
+          // was negative due to gas cost exceeding the SUI held in the position).
+          // Fall back to wallet balance so the freed tokens can still be used.
+          logger.warn('Closed position amounts are both 0 — falling back to wallet balance for zap', {
+            safeBalanceA: safeBalanceA.toString(),
+            safeBalanceB: safeBalanceB.toString(),
+          });
+          if (priceIsBelowRange) {
+            amountA = safeBalanceA.toString();
+            amountB = '0';
+          } else if (priceIsAboveRange) {
+            amountA = '0';
+            amountB = safeBalanceB.toString();
+          } else {
+            amountA = safeBalanceA.toString();
+            amountB = safeBalanceB.toString();
+          }
+        }
       } else if (priceIsBelowRange) {
         // Only token A is needed for a below-range position
         amountA = safeBalanceA.toString();
@@ -874,8 +896,17 @@ export class RebalanceService {
           liquidity: trackedPosition.liquidity,
         });
       } else {
-        logger.info('No existing positions with liquidity > 0 found in pool — nothing to rebalance');
-        return null;
+        // No positions with liquidity > 0.  Attempt to create a new one from
+        // wallet balance so the bot can recover after a failed rebalance cycle
+        // (where remove liquidity succeeded but add liquidity failed, leaving
+        // the freed tokens sitting in the wallet).
+        logger.info('No existing positions with liquidity > 0 found in pool — attempting to open a new position from wallet balance');
+        const recoveryResult = await this.createNewPosition(poolInfo);
+        // Only surface a non-null result when creation actually succeeded;
+        // failures (e.g. no wallet balance) are already logged inside
+        // createNewPosition and we don't want spurious "Rebalance executed"
+        // failure entries in the main check loop.
+        return recoveryResult.success ? recoveryResult : null;
       }
 
       // Check if the tracked position needs rebalancing
