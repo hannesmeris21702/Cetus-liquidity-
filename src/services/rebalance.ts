@@ -1248,10 +1248,19 @@ export class RebalanceService {
         }
       }
       
-      // Determine which token to fix based on available amounts.
-      // When one amount is 0 (common for out-of-range positions), this ensures
-      // we fix the non-zero token so the SDK can compute the required counterpart.
-      const fixAmountA = BigInt(amountA) >= BigInt(amountB);
+      // Determine which token to fix based on available amounts and position range.
+      // For out-of-range positions: fix the non-zero token so the SDK can compute the required counterpart (typically 0).
+      // For in-range positions: fix the smaller amount to ensure both tokens can be fully utilized.
+      //   - Fixing the smaller amount ensures the SDK's calculated requirement for the larger token
+      //     won't exceed what we have available, maximizing liquidity provision with both tokens.
+      let fixAmountA: boolean;
+      if (priceIsInRange && BigInt(amountA) > 0n && BigInt(amountB) > 0n) {
+        // In-range position with both tokens: fix the smaller amount
+        fixAmountA = BigInt(amountA) <= BigInt(amountB);
+      } else {
+        // Out-of-range position or one token is 0: fix the larger/non-zero amount
+        fixAmountA = BigInt(amountA) >= BigInt(amountB);
+      }
 
       // Determine whether we need to open a new position or add to an existing one.
       // When opening a new position we use is_open: true so the SDK combines
