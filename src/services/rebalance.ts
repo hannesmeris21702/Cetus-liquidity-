@@ -753,6 +753,59 @@ export class RebalanceService {
   }
 
   /**
+   * Determine which token amount to fix when calling createAddLiquidityFixTokenPayload.
+   *
+   * The Cetus CLMM Move contract's get_liquidity_by_amount aborts with error 3018 when:
+   *   - fix_amount_a=true  and current price >= upper tick (price at/above range)
+   *   - fix_amount_a=false and current price <  lower tick (price below range)
+   * Therefore for out-of-range positions the direction MUST be set by the price range,
+   * not by the token amounts.
+   *
+   * @param currentTickIndex - current pool tick index
+   * @param tickLower - position lower tick
+   * @param tickUpper - position upper tick
+   * @param amountA - available token A amount (as string)
+   * @param amountB - available token B amount (as string)
+   * @param preservedAmounts - optional preserved amounts from old position for ratio-based selection
+   * @returns true to fix token A, false to fix token B
+   */
+  private determineFixAmountA(
+    currentTickIndex: number,
+    tickLower: number,
+    tickUpper: number,
+    amountA: string,
+    amountB: string,
+    preservedAmounts?: { amountA: string; amountB: string }
+  ): boolean {
+    if (currentTickIndex < tickLower) {
+      // Price below range: only token A is needed; fixing token B would cause error 3018
+      return true;
+    }
+    if (currentTickIndex >= tickUpper) {
+      // Price at/above range: only token B is needed; fixing token A would cause error 3018
+      return false;
+    }
+    // Price is in range: choose direction that keeps SDK-computed counterpart within balance
+    if (BigInt(amountA) > 0n && BigInt(amountB) > 0n) {
+      if (preservedAmounts) {
+        const rA = BigInt(preservedAmounts.amountA);
+        const rB = BigInt(preservedAmounts.amountB);
+        // Guard: both rA and rB must be > 0 before using them in the ratio.
+        // If either is zero the old position was fully out-of-range; fall back to amount comparison.
+        if (rA > 0n && rB > 0n) {
+          // If we fix A, the SDK will compute neededB ≈ amountA * rB / rA.
+          // Only fix A when that estimate stays within our available amountB.
+          const neededBIfFixA = (BigInt(amountA) * rB) / rA; // rA > 0n, safe
+          return neededBIfFixA <= BigInt(amountB);
+        }
+      }
+      return BigInt(amountA) <= BigInt(amountB);
+    }
+    // One token is zero: fix the non-zero token
+    return BigInt(amountA) >= BigInt(amountB);
+  }
+
+  /**
    * Calculate swap amount with buffer for slippage.
    * Adds a 10% buffer to account for slippage and ensure sufficient tokens.
    */
@@ -1394,32 +1447,15 @@ export class RebalanceService {
       }
       
       // Determine which token to fix based on available amounts and position range.
-      // For out-of-range positions: fix the non-zero token so the SDK can compute the required counterpart (typically 0).
-      // For in-range positions: choose the fix direction that keeps the SDK-computed counterpart
-      //   within the available balance.  When the pool ratio is skewed, fixing the smaller token
-      //   can cause the SDK to compute a counterpart requirement that exceeds what we hold; in
-      //   that case we must fix the other token instead.
-      let fixAmountA: boolean;
-      if (priceIsInRange && BigInt(amountA) > 0n && BigInt(amountB) > 0n) {
-        if (preservedAmounts) {
-          const rA = BigInt(preservedAmounts.amountA);
-          const rB = BigInt(preservedAmounts.amountB);
-          if (rA > 0n && rB > 0n) {
-            // If we fix A, the SDK will compute neededB = amountA * rB / rA.
-            // Only fix A when that computed B stays within our available amountB.
-            const neededBIfFixA = (BigInt(amountA) * rB) / rA;
-            fixAmountA = neededBIfFixA <= BigInt(amountB);
-          } else {
-            fixAmountA = BigInt(amountA) <= BigInt(amountB);
-          }
-        } else {
-          // In-range position with both tokens and no preserved ratio: fix the smaller amount
-          fixAmountA = BigInt(amountA) <= BigInt(amountB);
-        }
-      } else {
-        // Out-of-range position or one token is 0: fix the larger/non-zero amount
-        fixAmountA = BigInt(amountA) >= BigInt(amountB);
-      }
+      // Determine which token to fix. See determineFixAmountA() for details.
+      const fixAmountA = this.determineFixAmountA(
+        currentTickIndex,
+        tickLower,
+        tickUpper,
+        amountA,
+        amountB,
+        preservedAmounts
+      );
 
       // Determine whether we need to open a new position or add to an existing one.
       // When opening a new position we use is_open: true so the SDK combines
@@ -1477,6 +1513,19 @@ export class RebalanceService {
             // Refetch pool state on each retry to get latest version
             const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
             const currentSqrtPrice = new BN(pool.current_sqrt_price);
+
+            // Re-determine fix_amount_a on every retry using the current tick index.
+            // This prevents get_liquidity_by_amount from aborting with error 3018 when
+            // the price moves between retries (e.g. in-range → above-range).
+            const currentPoolTick = pool.current_tick_index;
+            addLiquidityParams.fix_amount_a = this.determineFixAmountA(
+              currentPoolTick,
+              tickLower,
+              tickUpper,
+              amountA,
+              amountB,
+              preservedAmounts
+            );
             
             try {
               // Use createAddLiquidityFixTokenPayload which handles liquidity calculation
@@ -1529,6 +1578,17 @@ export class RebalanceService {
                 // Re-fetch pool state after swap
                 const poolAfterSwap = await sdk.Pool.getPool(poolInfo.poolAddress);
                 const currentSqrtPrice = new BN(poolAfterSwap.current_sqrt_price);
+
+                // Re-determine fix_amount_a after the swap to prevent error 3018
+                const tickAfterSwap = poolAfterSwap.current_tick_index;
+                addLiquidityParams.fix_amount_a = this.determineFixAmountA(
+                  tickAfterSwap,
+                  tickLower,
+                  tickUpper,
+                  amountA,
+                  amountB,
+                  preservedAmounts
+                );
                 
                 const retryPayload = await sdk.Position.createAddLiquidityFixTokenPayload(
                   addLiquidityParams as any,
