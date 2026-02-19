@@ -344,13 +344,17 @@ export class RebalanceService {
           const isSuiA = isSuiCoinType(poolInfo.coinTypeA);
           const isSuiB = isSuiCoinType(poolInfo.coinTypeB);
           
+          // Helper function to calculate safe balance with gas reserve
+          const calculateSafeBalance = (balance: bigint, isSui: boolean, gasReserve: bigint): bigint => {
+            if (isSui && balance > gasReserve) {
+              return balance - gasReserve;
+            }
+            return balance;
+          };
+          
           // Calculate safe balances after removing liquidity
-          const safeBalanceA = isSuiA && balanceAfterA > SUI_GAS_RESERVE
-            ? balanceAfterA - SUI_GAS_RESERVE
-            : balanceAfterA;
-          const safeBalanceB = isSuiB && balanceAfterB > SUI_GAS_RESERVE
-            ? balanceAfterB - SUI_GAS_RESERVE
-            : balanceAfterB;
+          const safeBalanceA = calculateSafeBalance(balanceAfterA, isSuiA, SUI_GAS_RESERVE);
+          const safeBalanceB = calculateSafeBalance(balanceAfterB, isSuiB, SUI_GAS_RESERVE);
           
           // Check if we need to swap based on position type
           if (priceIsBelowRange && removedAmountABigInt === 0n && removedAmountBBigInt > 0n) {
@@ -373,12 +377,8 @@ export class RebalanceService {
             const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
             const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
             
-            removedTokenAmounts.amountA = (isSuiA && swappedBalanceA > SUI_GAS_RESERVE
-              ? swappedBalanceA - SUI_GAS_RESERVE
-              : swappedBalanceA).toString();
-            removedTokenAmounts.amountB = (isSuiB && swappedBalanceB > SUI_GAS_RESERVE
-              ? swappedBalanceB - SUI_GAS_RESERVE
-              : swappedBalanceB).toString();
+            removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+            removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
             
             logger.info('Swapped tokens for new position', {
               newAmountA: removedTokenAmounts.amountA,
@@ -404,12 +404,8 @@ export class RebalanceService {
             const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
             const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
             
-            removedTokenAmounts.amountA = (isSuiA && swappedBalanceA > SUI_GAS_RESERVE
-              ? swappedBalanceA - SUI_GAS_RESERVE
-              : swappedBalanceA).toString();
-            removedTokenAmounts.amountB = (isSuiB && swappedBalanceB > SUI_GAS_RESERVE
-              ? swappedBalanceB - SUI_GAS_RESERVE
-              : swappedBalanceB).toString();
+            removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+            removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
             
             logger.info('Swapped tokens for new position', {
               newAmountA: removedTokenAmounts.amountA,
@@ -438,12 +434,8 @@ export class RebalanceService {
               const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
               const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
               
-              removedTokenAmounts.amountA = (isSuiA && swappedBalanceA > SUI_GAS_RESERVE
-                ? swappedBalanceA - SUI_GAS_RESERVE
-                : swappedBalanceA).toString();
-              removedTokenAmounts.amountB = (isSuiB && swappedBalanceB > SUI_GAS_RESERVE
-                ? swappedBalanceB - SUI_GAS_RESERVE
-                : swappedBalanceB).toString();
+              removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+              removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
               
               logger.info('Swapped tokens for new position', {
                 newAmountA: removedTokenAmounts.amountA,
@@ -470,12 +462,8 @@ export class RebalanceService {
               const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
               const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
               
-              removedTokenAmounts.amountA = (isSuiA && swappedBalanceA > SUI_GAS_RESERVE
-                ? swappedBalanceA - SUI_GAS_RESERVE
-                : swappedBalanceA).toString();
-              removedTokenAmounts.amountB = (isSuiB && swappedBalanceB > SUI_GAS_RESERVE
-                ? swappedBalanceB - SUI_GAS_RESERVE
-                : swappedBalanceB).toString();
+              removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+              removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
               
               logger.info('Swapped tokens for new position', {
                 newAmountA: removedTokenAmounts.amountA,
@@ -490,7 +478,14 @@ export class RebalanceService {
             });
           }
         } catch (swapError) {
-          logger.warn('Failed to swap tokens after removing liquidity. Will attempt swap during add liquidity.', swapError);
+          const errorMsg = swapError instanceof Error ? swapError.message : String(swapError);
+          logger.warn('Failed to swap tokens after removing liquidity. Will attempt swap during add liquidity.', {
+            error: errorMsg,
+            currentTickIndex: poolInfo.currentTickIndex,
+            newTickRange: `[${lower}, ${upper}]`,
+            removedAmountA: removedTokenAmounts?.amountA,
+            removedAmountB: removedTokenAmounts?.amountB,
+          });
           // Don't throw - the addLiquidity method has its own swap logic as a fallback
         }
       } else {
