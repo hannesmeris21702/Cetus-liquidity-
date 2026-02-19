@@ -155,7 +155,7 @@ console.log('Running fix_amount_a selection tests...\n');
 }
 
 console.log('\n=== Key Fix Validation ===');
-console.log('OLD BEHAVIOR (line 1254): const fixAmountA = BigInt(amountA) >= BigInt(amountB)');
+console.log('OLD BEHAVIOR: const fixAmountA = BigInt(amountA) >= BigInt(amountB)');
 console.log('  - For in-range with amountA=600, amountB=400: would fix A (larger)');
 console.log('  - Problem: SDK calculates required B, might exceed available 400');
 console.log('');
