@@ -428,15 +428,34 @@ export class RebalanceService {
         });
       }
 
+      // Save the old tracked position ID and clear tracking before attempting add liquidity
+      // This prevents the bot from tracking a position with zero liquidity if add liquidity fails
+      const oldTrackedPositionId = this.trackedPositionId;
+      if (!existingInRangePosition && hasLiquidity) {
+        // We're creating a new position and removed liquidity from old one
+        // Clear tracking temporarily until we confirm the new position is created
+        this.trackedPositionId = null;
+        logger.info('Cleared tracked position ID - will update after successful add liquidity');
+      }
+
       // Add liquidity to existing in-range position or create a new one
       // Pass the calculated token amounts to preserve the SAME liquidity parameter (L)
-      const result = await this.addLiquidity(
-        poolInfo, 
-        lower, 
-        upper, 
-        existingInRangePosition?.positionId, 
-        removedTokenAmounts
-      );
+      let result;
+      try {
+        result = await this.addLiquidity(
+          poolInfo, 
+          lower, 
+          upper, 
+          existingInRangePosition?.positionId, 
+          removedTokenAmounts
+        );
+      } catch (addLiquidityError) {
+        // Add liquidity failed - if we cleared tracking, keep it cleared so bot can recover
+        if (!existingInRangePosition && hasLiquidity) {
+          logger.warn('Add liquidity failed after removing liquidity from tracked position. Tracking cleared to allow recovery.');
+        }
+        throw addLiquidityError;
+      }
 
       // If a new position was created, discover it and update tracking so
       // subsequent cycles manage the new position instead of the old one.
@@ -452,9 +471,12 @@ export class RebalanceService {
           if (newPos) {
             this.trackedPositionId = newPos.positionId;
             logger.info('Now tracking newly created position', { positionId: newPos.positionId });
+          } else {
+            logger.warn('Could not find newly created position. Tracking will remain cleared.');
           }
         } catch (err) {
           logger.warn('Could not discover new position ID after rebalance', err);
+          // Keep tracking cleared if we couldn't discover the new position
         }
       }
 
@@ -700,11 +722,12 @@ export class RebalanceService {
 
   /**
    * Detect if an error message indicates insufficient balance.
-   * Matches error patterns: "Insufficient balance", "expect <amount>", "amount is Insufficient"
+   * Matches error patterns: "Insufficient balance", "InsufficientCoinBalance", "expect <amount>", "amount is Insufficient"
    */
   private isInsufficientBalanceError(errorMsg: string): boolean {
     const insufficientPatterns = [
       /insufficient balance/i,
+      /insufficientcoinbalance/i, // Matches "InsufficientCoinBalance" error from transactions
       /expect\s+\d+/i, // More specific: matches "expect <number>" pattern
       /amount is insufficient/i,
     ];
