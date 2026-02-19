@@ -312,6 +312,182 @@ export class RebalanceService {
         });
         
         logger.info('Successfully removed liquidity from old position');
+        
+        // Immediately check if we need to swap tokens to match the new position requirements
+        // This ensures both tokens are available before attempting to add liquidity
+        try {
+          const sdk = this.sdkService.getSdk();
+          const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+          const currentTickIndex = pool.current_tick_index;
+          
+          // Determine what tokens the new position will need
+          const priceIsBelowRange = currentTickIndex < lower;
+          const priceIsAboveRange = currentTickIndex >= upper;
+          const priceIsInRange = !priceIsBelowRange && !priceIsAboveRange;
+          
+          logger.info('Checking token requirements for new position', {
+            currentTickIndex,
+            newTickRange: `[${lower}, ${upper}]`,
+            priceIsBelowRange,
+            priceIsInRange,
+            priceIsAboveRange,
+          });
+          
+          const removedAmountABigInt = BigInt(removedTokenAmounts.amountA);
+          const removedAmountBBigInt = BigInt(removedTokenAmounts.amountB);
+          
+          // Reserve gas when a token is SUI
+          const SUI_GAS_RESERVE = BigInt(this.config.gasBudget);
+          const SUI_TYPE = '0x2::sui::SUI';
+          const SUI_TYPE_FULL = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
+          const isSuiCoinType = (ct: string) => ct === SUI_TYPE || ct === SUI_TYPE_FULL;
+          const isSuiA = isSuiCoinType(poolInfo.coinTypeA);
+          const isSuiB = isSuiCoinType(poolInfo.coinTypeB);
+          
+          // Helper function to calculate safe balance with gas reserve
+          const calculateSafeBalance = (balance: bigint, isSui: boolean, gasReserve: bigint): bigint => {
+            if (isSui && balance > gasReserve) {
+              return balance - gasReserve;
+            }
+            return balance;
+          };
+          
+          // Calculate safe balances after removing liquidity
+          const safeBalanceA = calculateSafeBalance(balanceAfterA, isSuiA, SUI_GAS_RESERVE);
+          const safeBalanceB = calculateSafeBalance(balanceAfterB, isSuiB, SUI_GAS_RESERVE);
+          
+          // Check if we need to swap based on position type
+          if (priceIsBelowRange && removedAmountABigInt === 0n && removedAmountBBigInt > 0n) {
+            // New position is out-of-range below: needs only token A, but we only have token B
+            logger.info('Position requires token A, but only have token B after removing liquidity. Swapping B→A...');
+            await this.performSwap(poolInfo, false, safeBalanceB.toString());
+            
+            // Update balances and removed amounts after swap
+            const swappedBalances = await Promise.all([
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeA,
+              }),
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeB,
+              }),
+            ]);
+            
+            const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
+            const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
+            
+            removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+            removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
+            
+            logger.info('Swapped tokens for new position', {
+              newAmountA: removedTokenAmounts.amountA,
+              newAmountB: removedTokenAmounts.amountB,
+            });
+          } else if (priceIsAboveRange && removedAmountBBigInt === 0n && removedAmountABigInt > 0n) {
+            // New position is out-of-range above: needs only token B, but we only have token A
+            logger.info('Position requires token B, but only have token A after removing liquidity. Swapping A→B...');
+            await this.performSwap(poolInfo, true, safeBalanceA.toString());
+            
+            // Update balances and removed amounts after swap
+            const swappedBalances = await Promise.all([
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeA,
+              }),
+              suiClient.getBalance({
+                owner: ownerAddress,
+                coinType: poolInfo.coinTypeB,
+              }),
+            ]);
+            
+            const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
+            const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
+            
+            removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+            removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
+            
+            logger.info('Swapped tokens for new position', {
+              newAmountA: removedTokenAmounts.amountA,
+              newAmountB: removedTokenAmounts.amountB,
+            });
+          } else if (priceIsInRange && (removedAmountABigInt === 0n || removedAmountBBigInt === 0n)) {
+            // New position is in-range: needs both tokens, but we only have one
+            if (removedAmountABigInt === 0n && removedAmountBBigInt > 0n) {
+              // Have only token B, need to swap half to get token A
+              logger.info('Position requires both tokens, but only have token B after removing liquidity. Swapping half B→A...');
+              const swapAmountB = safeBalanceB / 2n;
+              await this.performSwap(poolInfo, false, swapAmountB.toString());
+              
+              // Update balances and removed amounts after swap
+              const swappedBalances = await Promise.all([
+                suiClient.getBalance({
+                  owner: ownerAddress,
+                  coinType: poolInfo.coinTypeA,
+                }),
+                suiClient.getBalance({
+                  owner: ownerAddress,
+                  coinType: poolInfo.coinTypeB,
+                }),
+              ]);
+              
+              const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
+              const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
+              
+              removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+              removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
+              
+              logger.info('Swapped tokens for new position', {
+                newAmountA: removedTokenAmounts.amountA,
+                newAmountB: removedTokenAmounts.amountB,
+              });
+            } else if (removedAmountBBigInt === 0n && removedAmountABigInt > 0n) {
+              // Have only token A, need to swap half to get token B
+              logger.info('Position requires both tokens, but only have token A after removing liquidity. Swapping half A→B...');
+              const swapAmountA = safeBalanceA / 2n;
+              await this.performSwap(poolInfo, true, swapAmountA.toString());
+              
+              // Update balances and removed amounts after swap
+              const swappedBalances = await Promise.all([
+                suiClient.getBalance({
+                  owner: ownerAddress,
+                  coinType: poolInfo.coinTypeA,
+                }),
+                suiClient.getBalance({
+                  owner: ownerAddress,
+                  coinType: poolInfo.coinTypeB,
+                }),
+              ]);
+              
+              const swappedBalanceA = BigInt(swappedBalances[0].totalBalance);
+              const swappedBalanceB = BigInt(swappedBalances[1].totalBalance);
+              
+              removedTokenAmounts.amountA = calculateSafeBalance(swappedBalanceA, isSuiA, SUI_GAS_RESERVE).toString();
+              removedTokenAmounts.amountB = calculateSafeBalance(swappedBalanceB, isSuiB, SUI_GAS_RESERVE).toString();
+              
+              logger.info('Swapped tokens for new position', {
+                newAmountA: removedTokenAmounts.amountA,
+                newAmountB: removedTokenAmounts.amountB,
+              });
+            }
+          } else {
+            // Token distribution is already suitable for the new position
+            logger.info('Token distribution after removing liquidity is suitable for new position', {
+              amountA: removedTokenAmounts.amountA,
+              amountB: removedTokenAmounts.amountB,
+            });
+          }
+        } catch (swapError) {
+          const errorMsg = swapError instanceof Error ? swapError.message : String(swapError);
+          logger.warn('Failed to swap tokens after removing liquidity. Will attempt swap during add liquidity.', {
+            error: errorMsg,
+            currentTickIndex: poolInfo.currentTickIndex,
+            newTickRange: `[${lower}, ${upper}]`,
+            removedAmountA: removedTokenAmounts?.amountA,
+            removedAmountB: removedTokenAmounts?.amountB,
+          });
+          // Don't throw - the addLiquidity method has its own swap logic as a fallback
+        }
       } else {
         logger.info('Position has no liquidity - skipping removal step');
       }
