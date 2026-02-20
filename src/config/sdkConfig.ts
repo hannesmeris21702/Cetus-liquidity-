@@ -30,17 +30,17 @@ export const clmmMainnet: SdkOptions = {
   },
   cetus_config: {
     package_id: '0x95b8d278b876cae22206131fb9724f701c9444515813042f54f0a426c9a3bc2f',
-    published_at: '0x95b8d278b876cae22206131fb9724f701c9444515813042f54f0a426c9a3bc2f',
+    published_at: '0xba7e740c3c002673dbe69ad5fbdb0691ec260170e141297cefb982e7081fde52',
     config: mainnetSDKConfig.cetusConfig,
   },
   clmm_pool: {
     package_id: '0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb',
-    published_at: '0x70968826ad1b4ba895753f634b0aea68d0672908ca1075a2abdf0fc9e0b2fc6a',
+    published_at: '0x75b2e9ecad34944b8d0c874e568c90db0cf9437f0d7392abfd4cb902972f3e40',
     config: mainnetSDKConfig.clmmConfig,
   },
   integrate: {
     package_id: '0x996c4d9480708fb8b92aa7acf819fb0497b5ec8e65ba06601cae2fb6db3312c3',
-    published_at: '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7',
+    published_at: '0xb2db7142fa83210a7d78d9c12ac49c043b3cbbd482224fea6e3da00aa5a5ae2d',
   },
   deepbook: {
     package_id: '0x000000000000000000000000000000000000000000000000000000000000dee9',
