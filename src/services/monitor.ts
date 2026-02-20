@@ -104,8 +104,8 @@ export class PositionMonitorService {
         tickLower: pos.tick_lower_index,
         tickUpper: pos.tick_upper_index,
         liquidity: pos.liquidity,
-        tokenA: pos.coin_type_a,
-        tokenB: pos.coin_type_b,
+        tokenA: pos.coin_type_a.startsWith('0x') ? pos.coin_type_a : `0x${pos.coin_type_a}`,
+        tokenB: pos.coin_type_b.startsWith('0x') ? pos.coin_type_b : `0x${pos.coin_type_b}`,
         inRange: this.isPositionInRange(
           pos.tick_lower_index,
           pos.tick_upper_index,
