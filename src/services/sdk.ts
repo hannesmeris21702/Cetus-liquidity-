@@ -3,6 +3,7 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { CetusClmmSDK, initCetusSDK } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
+import { clmmMainnet } from '../config/sdkConfig';
 
 /**
  * Service for managing Cetus SDK and Sui client initialization.
@@ -94,6 +95,13 @@ export class CetusSDKService {
         fullNodeUrl: this.rpcUrl,
         wallet: address,
       });
+
+      // Override the integrate package address with the latest on-chain version.
+      // The SDK's bundled config may lag behind on-chain upgrades; using the
+      // correct published_at prevents "Unbound named address" errors at runtime.
+      if (config.network === 'mainnet') {
+        sdk.sdkOptions.integrate.published_at = clmmMainnet.integrate.published_at;
+      }
       
       // Set the sender address for transaction signing
       sdk.senderAddress = address;
