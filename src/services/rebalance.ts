@@ -359,6 +359,12 @@ export class RebalanceService {
       let coinTypeA = '';
       let coinTypeB = '';
 
+      // Pre-tx wallet balance snapshot for fallback when balance-change parsing
+      // yields 0 for both tokens.  Updated inside the retry callback before each
+      // attempt so the snapshot always matches the transaction that succeeds.
+      let preTxBalanceA = 0n;
+      let preTxBalanceB = 0n;
+
       // Execute remove liquidity with retry logic
       logger.info('Executing remove liquidity transaction');
       const result = await this.retryTransaction(
@@ -373,6 +379,16 @@ export class RebalanceService {
 
           coinTypeA = position.tokenA;
           coinTypeB = position.tokenB;
+
+          // Snapshot wallet balances immediately before the transaction so that
+          // a post-tx comparison can determine freed amounts if balance-change
+          // parsing fails (e.g. net SUI change is negative due to gas costs).
+          const [preBalA, preBalB] = await Promise.all([
+            suiClient.getBalance({ owner: ownerAddress, coinType: coinTypeA }),
+            suiClient.getBalance({ owner: ownerAddress, coinType: coinTypeB }),
+          ]);
+          preTxBalanceA = BigInt(preBalA.totalBalance);
+          preTxBalanceB = BigInt(preBalB.totalBalance);
 
           // Build remove liquidity transaction payload with fresh position data
           const params: RemoveLiquidityParams = {
@@ -447,11 +463,37 @@ export class RebalanceService {
           if (amt <= 0n) continue;
           const normalizedType = this.normalizeCoinType(change.coinType);
           if (normalizedType === normalizedTypeA) {
-            amountA = amt.toString();
+            amountA = (BigInt(amountA) + amt).toString();
           } else if (normalizedType === normalizedTypeB) {
-            amountB = amt.toString();
+            amountB = (BigInt(amountB) + amt).toString();
           }
         }
+      }
+
+      // Fallback: if balance-change parsing returned 0 for both tokens, compare
+      // the post-tx wallet balance against the pre-tx snapshot to determine how
+      // many tokens were actually freed by the close-position transaction.
+      // This handles cases where the RPC omits balance changes or gas arithmetic
+      // makes the net SUI change appear non-positive.
+      if (amountA === '0' && amountB === '0' && coinTypeA !== '' && coinTypeB !== '') {
+        logger.warn('Balance-change parsing yielded 0 for both tokens — comparing pre/post wallet balances to detect freed amounts');
+        const [postBalA, postBalB] = await Promise.all([
+          suiClient.getBalance({ owner: ownerAddress, coinType: coinTypeA }),
+          suiClient.getBalance({ owner: ownerAddress, coinType: coinTypeB }),
+        ]);
+        const deltaA = BigInt(postBalA.totalBalance) - preTxBalanceA;
+        const deltaB = BigInt(postBalB.totalBalance) - preTxBalanceB;
+        if (deltaA > 0n) {
+          amountA = deltaA.toString();
+        } else {
+          logger.warn('Post-tx balance delta for tokenA is not positive', { deltaA: deltaA.toString(), coinTypeA });
+        }
+        if (deltaB > 0n) {
+          amountB = deltaB.toString();
+        } else {
+          logger.warn('Post-tx balance delta for tokenB is not positive', { deltaB: deltaB.toString(), coinTypeB });
+        }
+        logger.info('Freed amounts from pre/post wallet balance comparison', { amountA, amountB });
       }
 
       logger.info('Liquidity removed successfully', {
