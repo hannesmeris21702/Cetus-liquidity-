@@ -421,12 +421,29 @@ export class RebalanceService {
 
       const balanceChanges: BalanceChange[] | null | undefined = result.balanceChanges;
 
+      // Compute total gas paid so we can recover the gross SUI amount freed from
+      // the position.  When gas > SUI held in the position the net SUI balance
+      // change is negative and would otherwise be filtered out, leaving both
+      // amounts as 0 and triggering an incorrect wallet-balance fallback.
+      const gasUsed = result.effects?.gasUsed;
+      const totalGasCost = gasUsed
+        ? BigInt(gasUsed.computationCost) + BigInt(gasUsed.storageCost) - BigInt(gasUsed.storageRebate)
+        : 0n;
+      const normalizedSuiType = this.normalizeCoinType('0x2::sui::SUI');
+
       if (balanceChanges) {
         for (const change of balanceChanges) {
           const owner = change.owner;
           if (typeof owner !== 'object' || !('AddressOwner' in owner)) continue;
           if ((owner as { AddressOwner: string }).AddressOwner.toLowerCase() !== ownerAddress.toLowerCase()) continue;
-          const amt = BigInt(change.amount);
+          let amt = BigInt(change.amount);
+          // For SUI the net balance change includes gas deduction and may be
+          // negative even when the position freed tokens.  Add back the total gas
+          // cost to recover the gross amount received from the position.
+          if (amt < 0n && totalGasCost > 0n && this.normalizeCoinType(change.coinType) === normalizedSuiType) {
+            const gross = amt + totalGasCost;
+            amt = gross > 0n ? gross : 0n;
+          }
           if (amt <= 0n) continue;
           const normalizedType = this.normalizeCoinType(change.coinType);
           if (normalizedType === normalizedTypeA) {
