@@ -609,6 +609,13 @@ export class RebalanceService {
         const errorMsg = error instanceof Error ? error.message : String(error);
         lastError = error instanceof Error ? error : new Error(errorMsg);
         
+        // MoveAbort errors are contract-level failures that cannot be resolved
+        // by retrying with the same parameters — throw immediately.
+        if (errorMsg.includes('MoveAbort')) {
+          logger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
+          throw error;
+        }
+
         if (attempt < maxRetries) {
           // Log retry attempt
           logger.warn(`Add liquidity attempt ${attempt} failed, retrying...`);
