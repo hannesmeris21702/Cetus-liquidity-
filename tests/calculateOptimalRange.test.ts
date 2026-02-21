@@ -84,4 +84,27 @@ function buildService(overrides: Partial<BotConfig> = {}): PositionMonitorServic
   console.log('✔ explicit rangeWidth – centred range preserved');
 }
 
+// ── RANGE_WIDTH from env is used for position opening during rebalance ───
+// When config.rangeWidth is set, rebalance.ts does NOT pass a preserveRangeWidth
+// to calculateOptimalRange, so the env-configured width is used instead of the
+// old position's width.
+
+{
+  const tickSpacing = 60;
+  const svc = buildService({ rangeWidth: 300 }); // RANGE_WIDTH=300 in env
+
+  // Simulate rebalancing a tracked position whose old width is 600.
+  // Because rangeWidth is set in config, rebalance.ts passes no preserveRangeWidth.
+  // calculateOptimalRange should therefore use config.rangeWidth (300), NOT the
+  // old position's width (600).
+  const { lower, upper } = svc.calculateOptimalRange(1000, tickSpacing /* no preserveRangeWidth */);
+  // ticksBelow = 150, ticksAbove = 150
+  // lower = floor((1000-150)/60)*60 = floor(850/60)*60 = 840
+  // upper = ceil((1000+150)/60)*60  = ceil(1150/60)*60  = 1200
+  assert.strictEqual(lower, 840, 'RANGE_WIDTH from env: lower tick');
+  assert.strictEqual(upper, 1200, 'RANGE_WIDTH from env: upper tick');
+  assert.ok(upper - lower < 600, 'env RANGE_WIDTH (300) should produce narrower range than old position width (600)');
+  console.log('✔ RANGE_WIDTH from env used for position opening (no preserveRangeWidth passed)');
+}
+
 console.log('\nAll calculateOptimalRange tests passed ✅');
