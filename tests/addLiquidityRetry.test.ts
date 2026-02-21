@@ -51,6 +51,13 @@ async function retryAddLiquidity<T>(
       const errorMsg = error instanceof Error ? error.message : String(error);
       lastError = error instanceof Error ? error : new Error(errorMsg);
 
+      // MoveAbort errors are contract-level failures that cannot be resolved
+      // by retrying with the same parameters — throw immediately.
+      if (errorMsg.includes('MoveAbort')) {
+        mockLogger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
+        throw error;
+      }
+
       if (attempt < maxRetries) {
         // Log retry attempt
         mockLogger.warn(`Add liquidity attempt ${attempt} failed, retrying...`);
@@ -200,6 +207,38 @@ async function runTests() {
     }
     
     console.log('✔ Add liquidity uses correct retry parameters');
+  }
+
+  // Test 6: MoveAbort errors are thrown immediately without retrying
+  {
+    mockLogger.clearLogs();
+    let callCount = 0;
+    const moveAbortError = new Error(
+      'MoveAbort(MoveLocation { module: ModuleId { address: b2db71..., name: Identifier("pool_script_v2") }, function: 23, instruction: 16, function_name: Some("repay_add_liquidity") }, 0) in command 1'
+    );
+
+    try {
+      await retryAddLiquidity(async () => {
+        callCount++;
+        throw moveAbortError;
+      }, 3, 10);
+      assert.fail('Should have thrown MoveAbort error immediately');
+    } catch (error) {
+      assert.strictEqual(error, moveAbortError, 'Should re-throw the original MoveAbort error');
+      assert.strictEqual(callCount, 1, 'Should only attempt once — no retries on MoveAbort');
+
+      const abortLog = mockLogger.logs.find(
+        (log) => log.level === 'error' && log.message.includes('Non-retryable MoveAbort error')
+      );
+      assert.ok(abortLog, 'Should log non-retryable MoveAbort error');
+
+      const retryLog = mockLogger.logs.find(
+        (log) => log.level === 'warn' && log.message.includes('failed, retrying')
+      );
+      assert.ok(!retryLog, 'Should NOT log any retry warning for MoveAbort');
+    }
+
+    console.log('✔ MoveAbort errors are thrown immediately without retrying');
   }
 
   console.log('\nAll add liquidity retry tests passed ✅');
