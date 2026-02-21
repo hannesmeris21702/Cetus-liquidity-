@@ -149,11 +149,11 @@ export class RebalanceService {
       });
 
       // Calculate the new optimal range.
-      // Env-configured ticks take priority: when LOWER_TICK and UPPER_TICK are
-      // both set, use them directly for the new position.  Otherwise, when
-      // tracking a specific position, preserve its original range width so the
-      // rebalanced position covers the same tick span.  Otherwise default to the
-      // tightest active range.
+      // Priority order:
+      //  1. LOWER_TICK + UPPER_TICK env vars → use exact ticks.
+      //  2. RANGE_WIDTH env var → centre the configured width around the current tick.
+      //  3. Tracking a specific position (and no RANGE_WIDTH) → preserve its range width.
+      //  4. Default → tightest active range (single tick-spacing bin).
       let lower: number;
       let upper: number;
       if (this.config.lowerTick !== undefined && this.config.upperTick !== undefined) {
@@ -161,7 +161,9 @@ export class RebalanceService {
         upper = this.config.upperTick;
         logger.info('Using env-configured tick range for new position', { lower, upper });
       } else {
-        const preserveWidth = this.trackedPositionId
+        // Use RANGE_WIDTH from env when set; only preserve the old position
+        // width as a fallback when no explicit range width is configured.
+        const preserveWidth = this.trackedPositionId && !this.config.rangeWidth
           ? position.tickUpper - position.tickLower
           : undefined;
         ({ lower, upper } = this.monitorService.calculateOptimalRange(
