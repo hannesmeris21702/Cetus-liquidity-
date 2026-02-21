@@ -148,17 +148,28 @@ export class RebalanceService {
         liquidity: position.liquidity,
       });
 
-      // Calculate the new optimal range.  When tracking a specific position,
-      // preserve its original range width so the rebalanced position covers the
-      // same tick span.  Otherwise default to the tightest active range.
-      const preserveWidth = this.trackedPositionId
-        ? position.tickUpper - position.tickLower
-        : undefined;
-      const { lower, upper } = this.monitorService.calculateOptimalRange(
-        poolInfo.currentTickIndex,
-        poolInfo.tickSpacing,
-        preserveWidth,
-      );
+      // Calculate the new optimal range.
+      // Env-configured ticks take priority: when LOWER_TICK and UPPER_TICK are
+      // both set, use them directly for the new position.  Otherwise, when
+      // tracking a specific position, preserve its original range width so the
+      // rebalanced position covers the same tick span.  Otherwise default to the
+      // tightest active range.
+      let lower: number;
+      let upper: number;
+      if (this.config.lowerTick !== undefined && this.config.upperTick !== undefined) {
+        lower = this.config.lowerTick;
+        upper = this.config.upperTick;
+        logger.info('Using env-configured tick range for new position', { lower, upper });
+      } else {
+        const preserveWidth = this.trackedPositionId
+          ? position.tickUpper - position.tickLower
+          : undefined;
+        ({ lower, upper } = this.monitorService.calculateOptimalRange(
+          poolInfo.currentTickIndex,
+          poolInfo.tickSpacing,
+          preserveWidth,
+        ));
+      }
 
       // If range hasn't changed significantly, skip rebalance
       if (
@@ -923,7 +934,21 @@ export class RebalanceService {
       let amountA: string;
       let amountB: string;
 
-      if (closedPositionAmounts) {
+      // Env-configured token amounts take priority over closed-position amounts
+      // and wallet balance.  When TOKEN_A_AMOUNT or TOKEN_B_AMOUNT are set the
+      // bot uses exactly those values for the new position regardless of what was
+      // freed from the old one.
+      // Note: either or both amounts may be set independently.  A zero amount for
+      // one side is valid for out-of-range (single-sided) positions.  When the
+      // position is in-range and only one token is provided, the existing zap-in
+      // swap logic (below) will automatically swap half to obtain both tokens.
+      const envAmountA = this.config.tokenAAmount;
+      const envAmountB = this.config.tokenBAmount;
+      if (envAmountA || envAmountB) {
+        amountA = envAmountA || '0';
+        amountB = envAmountB || '0';
+        logger.info('Using env-configured token amounts for new position', { amountA, amountB });
+      } else if (closedPositionAmounts) {
         const removedA = BigInt(closedPositionAmounts.amountA);
         const removedB = BigInt(closedPositionAmounts.amountB);
         if (removedA > 0n || removedB > 0n) {
