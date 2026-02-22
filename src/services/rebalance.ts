@@ -847,18 +847,20 @@ export class RebalanceService {
    *
    *  - Freed amount > 0 and ≤ safe wallet balance → use the freed amount
    *  - Freed amount > safe wallet balance          → cap to safe wallet balance
-   *  - Freed amount is 0 / undefined               → use 0 (not wallet balance)
+   *  - Both freed amounts are 0                   → fall back to full wallet balance
    *
    * When no closedPositionAmounts are given (new position from scratch) the
-   * original wallet-balance logic applies:
+   * wallet-balance logic applies for all range configurations.
    *
-   *  - Position below range  → only token A needed; amount_b = 0
-   *  - Position above range  → only token B needed; amount_a = 0
-   *  - Position in range     → provide both tokens; SDK calculates ratio from the fixed token
+   * Token conversion (zap) logic — applied after amounts are determined:
    *
-   * Zap-in: When an in-range position has only one token available (e.g. because
-   * the old position was single-sided), the method automatically swaps half of
-   * the available token to obtain both tokens before adding liquidity.
+   *  - In-range position with only one token → swap ≈ half to obtain both tokens
+   *  - Below-range position with only token B → swap all B → A (correct token for range)
+   *  - Above-range position with only token A → swap all A → B (correct token for range)
+   *
+   * This ensures the bot correctly handles close_position returning either
+   * token A or token B (depending on which side of the range the price moved to)
+   * and converts it to whatever the new position requires.
    */
   private async addLiquidity(
     poolInfo: PoolInfo,
@@ -972,24 +974,21 @@ export class RebalanceService {
             safeBalanceA: safeBalanceA.toString(),
             safeBalanceB: safeBalanceB.toString(),
           });
-          if (priceIsBelowRange) {
-            amountA = safeBalanceA.toString();
-            amountB = '0';
-          } else if (priceIsAboveRange) {
-            amountA = '0';
-            amountB = safeBalanceB.toString();
-          } else {
-            amountA = safeBalanceA.toString();
-            amountB = safeBalanceB.toString();
-          }
+          // Use both balances regardless of range — the wrong-token swap below
+          // will convert whichever token was actually received if needed.
+          amountA = safeBalanceA.toString();
+          amountB = safeBalanceB.toString();
         }
       } else if (priceIsBelowRange) {
-        // Only token A is needed for a below-range position
+        // Below-range position primarily needs token A.
+        // Include safeBalanceB so the wrong-token swap below can convert it to A
+        // when the wallet holds no A (e.g. after a failed rebalance where only B was received).
         amountA = safeBalanceA.toString();
-        amountB = '0';
+        amountB = safeBalanceB.toString();
       } else if (priceIsAboveRange) {
-        // Only token B is needed for an above-range position
-        amountA = '0';
+        // Above-range position primarily needs token B.
+        // Include safeBalanceA so the wrong-token swap can convert it to B if needed.
+        amountA = safeBalanceA.toString();
         amountB = safeBalanceB.toString();
       } else {
         // In-range position: provide both available token amounts.
@@ -1024,6 +1023,29 @@ export class RebalanceService {
             amountB = updated.amountB;
           }
         }
+      }
+
+      // Wrong-token swap for out-of-range positions.
+      // When close_position returns a single-sided token balance (e.g. only token B
+      // because the price rose above the old position's upper tick) but the new
+      // position happens to be on the opposite side of the current price, the
+      // bot must convert the received token to the one the new position requires.
+      //   - Below-range position needs only token A → swap all available token B → A
+      //   - Above-range position needs only token B → swap all available token A → B
+      if (priceIsBelowRange && BigInt(amountA) === 0n && BigInt(amountB) > 0n) {
+        const swapB = BigInt(amountB);
+        logger.info('Zap: position below range with only token B — swapping all B to A', { amountB });
+        // aToB=false (B→A), swapAmount=swapB, preSwapA=0 (none), preSwapB=swapB (all of B)
+        const updated = await this.performZapInSwap(poolInfo, false, swapB, /* preSwapA */ 0n, /* preSwapB */ swapB);
+        amountA = updated.amountA;
+        amountB = updated.amountB;
+      } else if (priceIsAboveRange && BigInt(amountB) === 0n && BigInt(amountA) > 0n) {
+        const swapA = BigInt(amountA);
+        logger.info('Zap: position above range with only token A — swapping all A to B', { amountA });
+        // aToB=true (A→B), swapAmount=swapA, preSwapA=swapA (all of A), preSwapB=0 (none)
+        const updated = await this.performZapInSwap(poolInfo, true, swapA, /* preSwapA */ swapA, /* preSwapB */ 0n);
+        amountA = updated.amountA;
+        amountB = updated.amountB;
       }
 
       const isOpen = !existingPositionId;
