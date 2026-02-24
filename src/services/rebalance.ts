@@ -1136,6 +1136,18 @@ export class RebalanceService {
           // position's requirements using TickMath.  If one token is in excess
           // (and the other is insufficient for the addLiquidity call), do a
           // corrective swap towards the required token.
+          //
+          // IMPORTANT: the try/catch below wraps ONLY the ratio computation
+          // (getPool + TickMath arithmetic).  The performZapInSwap call is
+          // deliberately kept OUTSIDE the try/catch so that a swap-transaction
+          // failure (network error, on-chain abort, etc.) propagates up to
+          // retryAddLiquidity rather than being silently swallowed here.
+          // If the swap error were swallowed the code would proceed with the
+          // original imbalanced amounts and the subsequent add-liquidity call
+          // would fail too — this was the root cause of
+          // "Zap-in ratio check failed — proceeding with available amounts".
+          let correctiveSwap: { aToB: boolean; swapAmount: bigint } | null = null;
+
           try {
             const poolForRatio = await sdk.Pool.getPool(poolInfo.poolAddress);
             const sqrtPriceCurrent = new BN(poolForRatio.current_sqrt_price);
@@ -1158,36 +1170,38 @@ export class RebalanceService {
                 const idealA = bigAmountB * refA / refB;
                 const swapAmount = (bigAmountA - idealA) / 2n;
                 if (swapAmount > 0n) {
-                  logger.info('Zap-in: corrective swap A→B to fix token ratio', {
-                    amountA, amountB, swapAmount: swapAmount.toString(),
-                  });
-                  const updated = await this.performZapInSwap(
-                    poolInfo, true, swapAmount, bigAmountA, bigAmountB,
-                    tickLower, tickUpper,
-                  );
-                  amountA = updated.amountA;
-                  amountB = updated.amountB;
+                  correctiveSwap = { aToB: true, swapAmount };
                 }
               } else if (excessB) {
                 // Too much B relative to A — swap some B → A.
                 const idealB = bigAmountA * refB / refA;
                 const swapAmount = (bigAmountB - idealB) / 2n;
                 if (swapAmount > 0n) {
-                  logger.info('Zap-in: corrective swap B→A to fix token ratio', {
-                    amountA, amountB, swapAmount: swapAmount.toString(),
-                  });
-                  const updated = await this.performZapInSwap(
-                    poolInfo, false, swapAmount, bigAmountA, bigAmountB,
-                    tickLower, tickUpper,
-                  );
-                  amountA = updated.amountA;
-                  amountB = updated.amountB;
+                  correctiveSwap = { aToB: false, swapAmount };
                 }
               }
               // else ratio is already correct — no swap needed
             }
           } catch (err) {
             logger.warn('Zap-in ratio check failed — proceeding with available amounts', { error: err });
+          }
+
+          // Execute corrective swap outside the ratio-computation try/catch so
+          // that swap-transaction errors propagate to the caller (retryAddLiquidity)
+          // instead of being silently swallowed.
+          if (correctiveSwap) {
+            const { aToB, swapAmount } = correctiveSwap;
+            const swapDir = aToB ? 'Zap-in: corrective swap A→B to fix token ratio'
+                                 : 'Zap-in: corrective swap B→A to fix token ratio';
+            logger.info(swapDir, {
+              amountA, amountB, swapAmount: swapAmount.toString(),
+            });
+            const updated = await this.performZapInSwap(
+              poolInfo, aToB, swapAmount, bigAmountA, bigAmountB,
+              tickLower, tickUpper,
+            );
+            amountA = updated.amountA;
+            amountB = updated.amountB;
           }
         }
       }
