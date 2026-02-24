@@ -1240,6 +1240,9 @@ export class RebalanceService {
         fix_amount_a: addLiquidityParams.fix_amount_a,
       });
 
+      // Flag to ensure the recovery swap is only attempted once across all retries.
+      let recoverySwapAttempted = false;
+
       const addResult = await this.retryAddLiquidity(
         async () => {
           // Refetch pool state on each retry for fresh sqrt price and tick index.
@@ -1250,27 +1253,101 @@ export class RebalanceService {
             freshPool.current_tick_index,
             tickLower,
             tickUpper,
-            amountA,
-            amountB,
+            addLiquidityParams.amount_a,
+            addLiquidityParams.amount_b,
           );
 
-          const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
-            addLiquidityParams as any,
-            { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
-          );
-          payload.setGasBudget(this.config.gasBudget);
+          try {
+            const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
+              addLiquidityParams as any,
+              { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
+            );
+            payload.setGasBudget(this.config.gasBudget);
 
-          const result = await suiClient.signAndExecuteTransaction({
-            transaction: payload,
-            signer: keypair,
-            options: { showEffects: true, showEvents: true },
-          });
+            const result = await suiClient.signAndExecuteTransaction({
+              transaction: payload,
+              signer: keypair,
+              options: { showEffects: true, showEvents: true },
+            });
 
-          if (result.effects?.status?.status !== 'success') {
-            throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
+            if (result.effects?.status?.status !== 'success') {
+              throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
+            }
+
+            return result;
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            // Detect SDK "Insufficient balance for <coinType>, expect <amount>" error.
+            // This is thrown by the Cetus SDK client-side before the transaction is built
+            // when the wallet does not hold enough of a required token.  Perform a one-time
+            // recovery swap to obtain the missing token and update the amounts so the next
+            // retry attempt can succeed.
+            const insuffMatch = errMsg.match(/Insufficient balance for ([^\s,]+)\s*,\s*expect\s+(\d+)/i);
+            if (insuffMatch && !recoverySwapAttempted) {
+              recoverySwapAttempted = true;
+              const neededCoinType = insuffMatch[1];
+              const normalizedNeeded = this.normalizeCoinType(neededCoinType);
+              const normalizedA = this.normalizeCoinType(poolInfo.coinTypeA);
+              const normalizedB = this.normalizeCoinType(poolInfo.coinTypeB);
+
+              try {
+                logger.info('Insufficient balance detected — performing recovery swap before retry', {
+                  neededCoinType,
+                  neededAmount: insuffMatch[2],
+                });
+
+                // Re-query wallet balances so the swap uses current on-chain state.
+                const [freshBalA, freshBalB] = await Promise.all([
+                  suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
+                  suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
+                ]);
+                const rawFreshA = BigInt(freshBalA.totalBalance);
+                const rawFreshB = BigInt(freshBalB.totalBalance);
+                const freshSafeBalA = isSuiA && rawFreshA > SUI_GAS_RESERVE ? rawFreshA - SUI_GAS_RESERVE : rawFreshA;
+                const freshSafeBalB = isSuiB && rawFreshB > SUI_GAS_RESERVE ? rawFreshB - SUI_GAS_RESERVE : rawFreshB;
+
+                // Half of balance as initial swap estimate (refined by performZapInSwap's tick math).
+                // Using `bal >= 2n ? bal / 2n : bal` avoids integer-division truncation to 0.
+                const halfOf = (bal: bigint) => bal >= 2n ? bal / 2n : bal;
+
+                let updated: { amountA: string; amountB: string } | null = null;
+                if (normalizedNeeded === normalizedA && freshSafeBalB > 0n) {
+                  // Need tokenA — swap tokenB → tokenA
+                  updated = await this.performZapInSwap(
+                    poolInfo, false, halfOf(freshSafeBalB),
+                    freshSafeBalA, freshSafeBalB,
+                    tickLower, tickUpper,
+                  );
+                } else if (normalizedNeeded === normalizedB && freshSafeBalA > 0n) {
+                  // Need tokenB — swap tokenA → tokenB
+                  updated = await this.performZapInSwap(
+                    poolInfo, true, halfOf(freshSafeBalA),
+                    freshSafeBalA, freshSafeBalB,
+                    tickLower, tickUpper,
+                  );
+                } else {
+                  logger.warn('Recovery swap skipped: no source token available', {
+                    normalizedNeeded, freshSafeBalA: freshSafeBalA.toString(), freshSafeBalB: freshSafeBalB.toString(),
+                  });
+                }
+
+                if (updated) {
+                  addLiquidityParams.amount_a = updated.amountA;
+                  addLiquidityParams.amount_b = updated.amountB;
+                  amountA = updated.amountA;
+                  amountB = updated.amountB;
+
+                  logger.info('Recovery swap completed — retrying add liquidity with updated amounts', {
+                    amountA: addLiquidityParams.amount_a,
+                    amountB: addLiquidityParams.amount_b,
+                  });
+                }
+              } catch (swapErr) {
+                logger.warn('Recovery swap failed — proceeding with original amounts', { error: swapErr });
+              }
+            }
+            throw err;
           }
-
-          return result;
         },
         3,
         3000,
