@@ -1001,6 +1001,16 @@ export class RebalanceService {
         throw new Error('Insufficient token balance for this position range. Please add tokens to your wallet.');
       }
 
+      // Track the swap direction when a zap-in swap is performed.  After the
+      // swap the output token is the constraining resource: its actual balance
+      // (slightly reduced by fees/slippage) must be the *fixed* amount passed
+      // to createAddLiquidityFixTokenPayload so the SDK computes the required
+      // counterpart from what we actually received, not from the other token.
+      //   aToB swap → output is B → fix_amount_a = false
+      //   bToA swap → output is A → fix_amount_a = true
+      // When no swap was performed, determineFixAmountA() is used as before.
+      let postZapFixAmountA: boolean | undefined = undefined;
+
       // Zap-in: when the new position is in-range but we only have one token,
       // swap approximately half of it so both tokens are available for the
       // add-liquidity call.  This is the core "zap in" behaviour.
@@ -1021,6 +1031,9 @@ export class RebalanceService {
             );
             amountA = updated.amountA;
             amountB = updated.amountB;
+            // Fix on the output token so the SDK computes required counterpart
+            // from what was actually received, preventing insufficient-balance errors.
+            postZapFixAmountA = !aToB;
           }
         }
       }
@@ -1051,6 +1064,14 @@ export class RebalanceService {
       const isOpen = !existingPositionId;
       const positionId = existingPositionId || '';
 
+      // Determine initial fix_amount_a: prefer postZapFixAmountA when the
+      // position is in-range and a zap swap was performed; otherwise use the
+      // range-based heuristic so out-of-range positions are handled correctly.
+      const positionIsInRange = !priceIsBelowRange && !priceIsAboveRange;
+      const initialFixAmountA = (positionIsInRange && postZapFixAmountA !== undefined)
+        ? postZapFixAmountA
+        : this.determineFixAmountA(currentTickIndex, tickLower, tickUpper, amountA, amountB);
+
       const addLiquidityParams: AddLiquidityFixTokenParams = {
         pool_id: poolInfo.poolAddress,
         pos_id: positionId,
@@ -1059,7 +1080,7 @@ export class RebalanceService {
         amount_a: amountA,
         amount_b: amountB,
         slippage: this.config.maxSlippage,
-        fix_amount_a: this.determineFixAmountA(currentTickIndex, tickLower, tickUpper, amountA, amountB),
+        fix_amount_a: initialFixAmountA,
         is_open: isOpen,
         coinTypeA: poolInfo.coinTypeA,
         coinTypeB: poolInfo.coinTypeB,
@@ -1079,13 +1100,14 @@ export class RebalanceService {
           // Re-evaluating fix_amount_a prevents error 3018 when price moves between retries.
           const freshPool = await sdk.Pool.getPool(poolInfo.poolAddress);
           const freshSqrtPrice = new BN(freshPool.current_sqrt_price);
-          addLiquidityParams.fix_amount_a = this.determineFixAmountA(
-            freshPool.current_tick_index,
-            tickLower,
-            tickUpper,
-            amountA,
-            amountB,
-          );
+          const freshTick = freshPool.current_tick_index;
+          const freshInRange = freshTick >= tickLower && freshTick < tickUpper;
+          // When in-range and a zap swap was performed, use the swap-direction-based
+          // fix_amount_a to ensure the required counterpart stays within available balance.
+          // If price moved out of range since the zap, fall back to the range-based logic.
+          addLiquidityParams.fix_amount_a = (freshInRange && postZapFixAmountA !== undefined)
+            ? postZapFixAmountA
+            : this.determineFixAmountA(freshTick, tickLower, tickUpper, amountA, amountB);
 
           const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
             addLiquidityParams as any,
