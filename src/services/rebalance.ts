@@ -625,7 +625,11 @@ export class RebalanceService {
         
         // MoveAbort errors are contract-level failures that cannot be resolved
         // by retrying with the same parameters — throw immediately.
-        if (errorMsg.includes('MoveAbort')) {
+        // Exception: add_liquidity_fix_coin aborting with code 0 (delta_liquidity == 0)
+        // may be caused by severely imbalanced token amounts after a failed corrective
+        // swap; the recovery-swap inside the operation will rebalance them on the next retry.
+        if (errorMsg.includes('MoveAbort') &&
+            !(errorMsg.includes('add_liquidity_fix_coin') && /,\s*0\s*\)/.test(errorMsg))) {
           logger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
           throw error;
         }
@@ -1335,18 +1339,37 @@ export class RebalanceService {
             // recovery swap to obtain the missing token and update the amounts so the next
             // retry attempt can succeed.
             const insuffMatch = errMsg.match(/Insufficient balance for ([^\s,]+)\s*,\s*expect\s+(\d+)/i);
-            if (insuffMatch && !recoverySwapAttempted) {
+            // MoveAbort code 0 from add_liquidity_fix_coin = delta_liquidity is zero.
+            // This is caused by severely imbalanced token amounts (the fixed token is too
+            // small to produce non-zero liquidity) after a failed corrective swap.
+            // The direction of the recovery swap is inferred from fix_amount_a:
+            //   fix_amount_a=false → B is fixed but too small → swap A→B (need more B)
+            //   fix_amount_a=true  → A is fixed but too small → swap B→A (need more A)
+            const isMoveAbortZeroFixCoin = errMsg.includes('add_liquidity_fix_coin') &&
+              /,\s*0\s*\)/.test(errMsg);
+            if ((insuffMatch || isMoveAbortZeroFixCoin) && !recoverySwapAttempted) {
               recoverySwapAttempted = true;
-              const neededCoinType = insuffMatch[1];
-              const normalizedNeeded = this.normalizeCoinType(neededCoinType);
               const normalizedA = this.normalizeCoinType(poolInfo.coinTypeA);
               const normalizedB = this.normalizeCoinType(poolInfo.coinTypeB);
+              // For "Insufficient balance" the needed coin type comes from the error message.
+              // For MoveAbort code 0 it is inferred from fix_amount_a (the fixed/deficit token).
+              const normalizedNeeded = insuffMatch
+                ? this.normalizeCoinType(insuffMatch[1])
+                : (addLiquidityParams.fix_amount_a ? normalizedA : normalizedB);
 
               try {
-                logger.info('Insufficient balance detected — performing recovery swap before retry', {
-                  neededCoinType,
-                  neededAmount: insuffMatch[2],
-                });
+                if (insuffMatch) {
+                  logger.info('Insufficient balance detected — performing recovery swap before retry', {
+                    neededCoinType: insuffMatch[1],
+                    neededAmount: insuffMatch[2],
+                  });
+                } else {
+                  logger.info('MoveAbort code 0 (zero liquidity) — performing recovery swap to rebalance amounts', {
+                    fix_amount_a: addLiquidityParams.fix_amount_a,
+                    amountA: addLiquidityParams.amount_a,
+                    amountB: addLiquidityParams.amount_b,
+                  });
+                }
 
                 // Re-query wallet balances so the swap uses current on-chain state.
                 const [freshBalA, freshBalB] = await Promise.all([
