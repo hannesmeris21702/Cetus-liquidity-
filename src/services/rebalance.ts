@@ -1186,9 +1186,11 @@ export class RebalanceService {
             logger.warn('Zap-in ratio check failed — proceeding with available amounts', { error: err });
           }
 
-          // Execute corrective swap outside the ratio-computation try/catch so
-          // that swap-transaction errors propagate to the caller (retryAddLiquidity)
-          // instead of being silently swallowed.
+          // Execute corrective swap.  Wrapped in try/catch so that if the swap
+          // fails (e.g. the SDK rejects it with "Insufficient balance" before the
+          // transaction is even submitted), execution falls through to
+          // retryAddLiquidity where the in-retry recovery swap will handle the
+          // imbalance instead of the error short-circuiting addLiquidity entirely.
           if (correctiveSwap) {
             const { aToB, swapAmount } = correctiveSwap;
             const swapDir = aToB ? 'Zap-in: corrective swap A→B to fix token ratio'
@@ -1196,12 +1198,19 @@ export class RebalanceService {
             logger.info(swapDir, {
               amountA, amountB, swapAmount: swapAmount.toString(),
             });
-            const updated = await this.performZapInSwap(
-              poolInfo, aToB, swapAmount, bigAmountA, bigAmountB,
-              tickLower, tickUpper,
-            );
-            amountA = updated.amountA;
-            amountB = updated.amountB;
+            try {
+              const updated = await this.performZapInSwap(
+                poolInfo, aToB, swapAmount, bigAmountA, bigAmountB,
+                tickLower, tickUpper,
+              );
+              amountA = updated.amountA;
+              amountB = updated.amountB;
+            } catch (swapErr) {
+              // Corrective swap failed — proceed with pre-swap amounts.  The
+              // recovery swap inside retryAddLiquidity will handle the remaining
+              // token imbalance when createAddLiquidityFixTokenPayload fails.
+              logger.warn('Corrective zap-in swap failed — proceeding with pre-swap amounts; recovery swap will retry', { error: swapErr });
+            }
           }
         }
       }
@@ -1213,20 +1222,30 @@ export class RebalanceService {
       // bot must convert the received token to the one the new position requires.
       //   - Below-range position needs only token A → swap all available token B → A
       //   - Above-range position needs only token B → swap all available token A → B
+      // Wrapped in try/catch so a swap failure falls through to retryAddLiquidity's
+      // recovery swap rather than short-circuiting addLiquidity entirely.
       if (priceIsBelowRange && BigInt(amountA) === 0n && BigInt(amountB) > 0n) {
         const swapB = BigInt(amountB);
         logger.info('Zap: position below range with only token B — swapping all B to A', { amountB });
         // aToB=false (B→A), swapAmount=swapB, preSwapA=0 (none), preSwapB=swapB (all of B)
-        const updated = await this.performZapInSwap(poolInfo, false, swapB, /* preSwapA */ 0n, /* preSwapB */ swapB);
-        amountA = updated.amountA;
-        amountB = updated.amountB;
+        try {
+          const updated = await this.performZapInSwap(poolInfo, false, swapB, /* preSwapA */ 0n, /* preSwapB */ swapB);
+          amountA = updated.amountA;
+          amountB = updated.amountB;
+        } catch (swapErr) {
+          logger.warn('Wrong-token swap (B→A) failed — proceeding with pre-swap amounts; recovery swap will retry', { error: swapErr });
+        }
       } else if (priceIsAboveRange && BigInt(amountB) === 0n && BigInt(amountA) > 0n) {
         const swapA = BigInt(amountA);
         logger.info('Zap: position above range with only token A — swapping all A to B', { amountA });
         // aToB=true (A→B), swapAmount=swapA, preSwapA=swapA (all of A), preSwapB=0 (none)
-        const updated = await this.performZapInSwap(poolInfo, true, swapA, /* preSwapA */ swapA, /* preSwapB */ 0n);
-        amountA = updated.amountA;
-        amountB = updated.amountB;
+        try {
+          const updated = await this.performZapInSwap(poolInfo, true, swapA, /* preSwapA */ swapA, /* preSwapB */ 0n);
+          amountA = updated.amountA;
+          amountB = updated.amountB;
+        } catch (swapErr) {
+          logger.warn('Wrong-token swap (A→B) failed — proceeding with pre-swap amounts; recovery swap will retry', { error: swapErr });
+        }
       }
 
       const isOpen = !existingPositionId;
@@ -1320,22 +1339,24 @@ export class RebalanceService {
                 const freshSafeBalA = isSuiA && rawFreshA > SUI_GAS_RESERVE ? rawFreshA - SUI_GAS_RESERVE : rawFreshA;
                 const freshSafeBalB = isSuiB && rawFreshB > SUI_GAS_RESERVE ? rawFreshB - SUI_GAS_RESERVE : rawFreshB;
 
-                // Half of balance as initial swap estimate (refined by performZapInSwap's tick math).
-                // Using `bal >= 2n ? bal / 2n : bal` avoids integer-division truncation to 0.
-                const halfOf = (bal: bigint) => bal >= 2n ? bal / 2n : bal;
-
+                // Use the full available balance as the initial swap estimate so that
+                // the preswap exchange rate is computed for the actual swap size.
+                // computeOptimalZapSwapAmount will refine this to the correct fraction
+                // of the total that achieves the required A:B ratio.  Using the full
+                // balance (instead of half) gives a more accurate exchange-rate baseline
+                // and ensures the recovery swap provides enough of the required token.
                 let updated: { amountA: string; amountB: string } | null = null;
                 if (normalizedNeeded === normalizedA && freshSafeBalB > 0n) {
                   // Need tokenA — swap tokenB → tokenA
                   updated = await this.performZapInSwap(
-                    poolInfo, false, halfOf(freshSafeBalB),
+                    poolInfo, false, freshSafeBalB,
                     freshSafeBalA, freshSafeBalB,
                     tickLower, tickUpper,
                   );
                 } else if (normalizedNeeded === normalizedB && freshSafeBalA > 0n) {
                   // Need tokenB — swap tokenA → tokenB
                   updated = await this.performZapInSwap(
-                    poolInfo, true, halfOf(freshSafeBalA),
+                    poolInfo, true, freshSafeBalA,
                     freshSafeBalA, freshSafeBalB,
                     tickLower, tickUpper,
                   );
