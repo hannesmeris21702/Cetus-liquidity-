@@ -1,14 +1,16 @@
 /**
- * Tests for the zap-in optimal swap logic.
+ * Tests for the single-token zap-in logic.
  *
- * Verifies that:
- * 1. The optimal swap amount is computed correctly for B→A and A→B cases.
- * 2. The corrective swap direction is detected when both tokens are available
- *    but in the wrong ratio for the position.
- * 3. The fix_amount_a selection uses the SMALLER amount for in-range positions
- *    so the SDK-computed counterpart stays within the available balance.
- * 4. After a zap-in swap the bot uses the fresh wallet balance (not a potentially
- *    overestimated balance-change calculation).
+ * The Cetus SDK zap-in requires only ONE token as input.  The SDK internally
+ * performs the necessary swap and adds liquidity to the position.
+ *
+ * This test verifies:
+ * 1. The correct single token is selected based on position range and available
+ *    balances.
+ * 2. fix_amount_a is always derived as `BigInt(amountA) > 0n`.
+ * 3. The counterpart token is always set to '0'.
+ * 4. Env-var token amounts take priority and are passed as-is (single-sided).
+ * 5. Freed tokens from a closed position are correctly filtered to one token.
  *
  * Run with: npx ts-node tests/zapInOptimalSwap.test.ts
  */
@@ -16,299 +18,277 @@
 import assert from 'assert';
 
 // ---------------------------------------------------------------------------
-// Pure reimplementation of computeOptimalZapSwapAmount
-// (mirrors the private method added to RebalanceService)
+// Reimplementation of the single-token amount-selection logic
+// (mirrors RebalanceService.addLiquidity)
 // ---------------------------------------------------------------------------
 
-/**
- * Compute optimal swap amount given:
- *  totalInput   – total amount of the input token
- *  aToB         – true = A→B, false = B→A
- *  estimatedOut – estimated output for swapAmountForEstimate
- *  swapAmountForEstimate – the reference input amount used to obtain estimatedOut
- *  refA, refB   – required token amounts per unit of liquidity (from tick math)
- */
-function computeOptimalZapSwapAmount(
-  totalInput: bigint,
-  aToB: boolean,
-  estimatedOut: bigint,
-  swapAmountForEstimate: bigint,
-  refA: bigint,
-  refB: bigint,
-  fallback: bigint,
-): bigint {
-  if (refA === 0n || refB === 0n) return fallback;
-  const E_numer = estimatedOut;
-  const E_denom = swapAmountForEstimate;
+function calculateZapAmount(removedAmount: bigint, safeBalance: bigint): string {
+  if (removedAmount <= 0n) return '0';
+  if (safeBalance === 0n) return removedAmount.toString();
+  return (removedAmount <= safeBalance ? removedAmount : safeBalance).toString();
+}
 
-  let numerator: bigint;
-  let denominator: bigint;
+interface ZapParams {
+  amountA: string;
+  amountB: string;
+  fixAmountA: boolean;
+}
 
-  if (aToB) {
-    // X = refB × total × E_denom / (refA × E_numer + refB × E_denom)
-    numerator = refB * totalInput * E_denom;
-    denominator = refA * E_numer + refB * E_denom;
+function selectZapParams(opts: {
+  safeBalanceA: bigint;
+  safeBalanceB: bigint;
+  priceIsBelowRange: boolean;
+  priceIsAboveRange: boolean;
+  envAmountA?: string;
+  envAmountB?: string;
+  closedPositionAmounts?: { amountA: string; amountB: string };
+}): ZapParams {
+  const {
+    safeBalanceA, safeBalanceB,
+    priceIsBelowRange, priceIsAboveRange,
+    envAmountA, envAmountB,
+    closedPositionAmounts,
+  } = opts;
+
+  let amountA: string;
+  let amountB: string;
+
+  if (envAmountA) {
+    amountA = envAmountA;
+    amountB = '0';
+  } else if (envAmountB) {
+    amountA = '0';
+    amountB = envAmountB;
+  } else if (closedPositionAmounts) {
+    const removedA = BigInt(closedPositionAmounts.amountA);
+    const removedB = BigInt(closedPositionAmounts.amountB);
+    if (removedA > 0n || removedB > 0n) {
+      if (!priceIsAboveRange && removedA > 0n) {
+        amountA = calculateZapAmount(removedA, safeBalanceA);
+        amountB = '0';
+      } else {
+        amountA = '0';
+        amountB = removedB > 0n
+          ? calculateZapAmount(removedB, safeBalanceB)
+          : safeBalanceB.toString();
+      }
+    } else {
+      if (!priceIsAboveRange && safeBalanceA > 0n) {
+        amountA = safeBalanceA.toString();
+        amountB = '0';
+      } else {
+        amountA = '0';
+        amountB = safeBalanceB.toString();
+      }
+    }
+  } else if (priceIsBelowRange) {
+    amountA = safeBalanceA.toString();
+    amountB = '0';
+  } else if (priceIsAboveRange) {
+    amountA = '0';
+    amountB = safeBalanceB.toString();
   } else {
-    // X = refA × total × E_denom / (E_numer × refB + refA × E_denom)
-    numerator = refA * totalInput * E_denom;
-    denominator = E_numer * refB + refA * E_denom;
+    if (safeBalanceA > 0n) {
+      amountA = safeBalanceA.toString();
+      amountB = '0';
+    } else {
+      amountA = '0';
+      amountB = safeBalanceB.toString();
+    }
   }
 
-  if (denominator === 0n) return fallback;
-  const optimal = numerator / denominator;
-  if (optimal <= 0n || optimal >= totalInput) return fallback;
-  return optimal;
-}
-
-// ---------------------------------------------------------------------------
-// Pure reimplementation of corrective-swap direction detection
-// (mirrors the new in-range both-tokens block added to addLiquidity)
-// ---------------------------------------------------------------------------
-
-interface CorrectiveSwapDecision {
-  needsSwap: boolean;
-  aToB?: boolean;
-  swapAmount?: bigint;
-}
-
-function detectCorrectiveSwap(
-  amountA: bigint,
-  amountB: bigint,
-  refA: bigint,
-  refB: bigint,
-): CorrectiveSwapDecision {
-  if (amountA === 0n || amountB === 0n || refA === 0n || refB === 0n) {
-    return { needsSwap: false };
-  }
-  const excessA = amountA * refB > refA * amountB;
-  const excessB = amountB * refA > refB * amountA;
-
-  if (excessA) {
-    const idealA = (amountB * refA) / refB;
-    const swapAmount = (amountA - idealA) / 2n;
-    return swapAmount > 0n ? { needsSwap: true, aToB: true, swapAmount } : { needsSwap: false };
-  }
-  if (excessB) {
-    const idealB = (amountA * refB) / refA;
-    const swapAmount = (amountB - idealB) / 2n;
-    return swapAmount > 0n ? { needsSwap: true, aToB: false, swapAmount } : { needsSwap: false };
-  }
-  return { needsSwap: false };
-}
-
-// ---------------------------------------------------------------------------
-// Pure reimplementation of determineFixAmountA for in-range (new behavior)
-// ---------------------------------------------------------------------------
-
-function determineFixAmountA(
-  priceIsBelowRange: boolean,
-  priceIsAboveRange: boolean,
-  amountA: string,
-  amountB: string,
-): boolean {
-  if (priceIsBelowRange) return true;   // only token A needed
-  if (priceIsAboveRange) return false;  // only token B needed
-  // In-range: fix the SMALLER token (new behaviour)
-  return BigInt(amountA) <= BigInt(amountB);
+  return { amountA, amountB, fixAmountA: BigInt(amountA) > 0n };
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-console.log('Running zap-in optimal swap tests...\n');
+console.log('Running single-token zap-in tests...\n');
 
-// ── computeOptimalZapSwapAmount ───────────────────────────────────────────
+// ── Basic range-based selection ─────────────────────────────────────────────
 
-// 1. Symmetric price (1:1) and symmetric required ratio → swap exactly half
+// 1. Below-range: use token A, SDK swaps as needed
 {
-  // refA = refB = 1000 (equal ratio), E = 1:1 (estimatedOut = swapAmount)
-  const total = 10_000_000n;
-  const halfSwap = total / 2n;
-  const estimatedOut = halfSwap; // 1:1 rate
-  const refA = 1000n, refB = 1000n;
-  const optimal = computeOptimalZapSwapAmount(
-    total, false, estimatedOut, halfSwap, refA, refB, halfSwap,
-  );
-  // With 1:1 price and 1:1 ratio the optimal should be exactly half
-  assert.strictEqual(optimal, halfSwap, 'Symmetric 1:1 should yield half swap');
-  console.log('✔ Symmetric 1:1 price & ratio → swap exactly half');
+  const p = selectZapParams({ safeBalanceA: 5_000_000n, safeBalanceB: 3_000_000n, priceIsBelowRange: true, priceIsAboveRange: false });
+  assert.strictEqual(p.amountA, '5000000', 'below-range: full A balance');
+  assert.strictEqual(p.amountB, '0', 'below-range: B must be 0');
+  assert.strictEqual(p.fixAmountA, true, 'below-range: fixAmountA=true');
+  console.log('✔ Below-range: uses token A as sole zap input, SDK handles swap');
 }
 
-// 2. Position biased towards A (needs more A than B) with 1:1 price
+// 2. Above-range: use token B, SDK swaps as needed
 {
-  // refA = 3000, refB = 1000 → need 3× more A than B per unit of liquidity
-  // Starting with 10M B and 1:1 rate, optimal X to swap B→A:
-  //   X = refA × total × E_denom / (E_numer × refB + refA × E_denom)
-  //   X = 3000 × 10M × 5M / (5M × 1000 + 3000 × 5M)
-  //   X = 3000 × 10M × 5M / (5M × 4000)
-  //   X = 3000 × 10M / 4000 = 7 500 000
-  const total = 10_000_000n;
-  const halfSwap = total / 2n;
-  const estimatedOut = halfSwap; // 1:1 rate
-  const refA = 3000n, refB = 1000n;
-  const optimal = computeOptimalZapSwapAmount(
-    total, false, estimatedOut, halfSwap, refA, refB, halfSwap,
-  );
-  assert.ok(optimal > halfSwap, 'A-biased position should swap more than half');
-  assert.ok(optimal < total, 'Should not swap everything');
-  console.log(`✔ A-biased position (refA:refB=3:1) → swap ${optimal} of ${total} B (> half)`);
+  const p = selectZapParams({ safeBalanceA: 5_000_000n, safeBalanceB: 3_000_000n, priceIsBelowRange: false, priceIsAboveRange: true });
+  assert.strictEqual(p.amountA, '0', 'above-range: A must be 0');
+  assert.strictEqual(p.amountB, '3000000', 'above-range: full B balance');
+  assert.strictEqual(p.fixAmountA, false, 'above-range: fixAmountA=false');
+  console.log('✔ Above-range: uses token B as sole zap input, SDK handles swap');
 }
 
-// 3. Position biased towards B (needs more B than A) with 1:1 price
+// 3. In-range with token A available: use A, SDK handles swap to correct ratio
 {
-  const total = 10_000_000n;
-  const halfSwap = total / 2n;
-  const estimatedOut = halfSwap; // 1:1 rate
-  const refA = 1000n, refB = 3000n;
-  const optimal = computeOptimalZapSwapAmount(
-    total, false, estimatedOut, halfSwap, refA, refB, halfSwap,
-  );
-  assert.ok(optimal < halfSwap, 'B-biased position should swap less than half');
-  assert.ok(optimal > 0n, 'Should swap something positive');
-  console.log(`✔ B-biased position (refA:refB=1:3) → swap ${optimal} of ${total} B (< half)`);
+  const p = selectZapParams({ safeBalanceA: 8_000_000n, safeBalanceB: 4_000_000n, priceIsBelowRange: false, priceIsAboveRange: false });
+  assert.strictEqual(p.amountA, '8000000', 'in-range: prefers A when available');
+  assert.strictEqual(p.amountB, '0', 'in-range: B must be 0 (single-token)');
+  assert.strictEqual(p.fixAmountA, true, 'in-range: fixAmountA=true when A chosen');
+  console.log('✔ In-range with A: uses A only, SDK calculates ratio and swaps internally');
 }
 
-// 4. Returns fallback when refA is zero (price at upper tick — no A needed)
+// 4. In-range with no token A: fall back to B
 {
-  const total = 10_000_000n;
-  const halfSwap = total / 2n;
-  const optimal = computeOptimalZapSwapAmount(
-    total, false, halfSwap, halfSwap, 0n, 1000n, halfSwap,
-  );
-  assert.strictEqual(optimal, halfSwap, 'refA=0 should return fallback');
-  console.log('✔ refA=0 (price at upper tick) → returns fallback safely');
+  const p = selectZapParams({ safeBalanceA: 0n, safeBalanceB: 4_000_000n, priceIsBelowRange: false, priceIsAboveRange: false });
+  assert.strictEqual(p.amountA, '0');
+  assert.strictEqual(p.amountB, '4000000', 'in-range, no A: uses B');
+  assert.strictEqual(p.fixAmountA, false);
+  console.log('✔ In-range, no A: falls back to token B, SDK handles ratio');
 }
 
-// 5. Returns fallback when refB is zero (price at lower tick — no B needed)
+// ── Env-var token amounts ────────────────────────────────────────────────────
+
+// 5. TOKEN_A_AMOUNT env set: use it, ignore balance and range
 {
-  const total = 10_000_000n;
-  const halfSwap = total / 2n;
-  const optimal = computeOptimalZapSwapAmount(
-    total, true, halfSwap, halfSwap, 1000n, 0n, halfSwap,
-  );
-  assert.strictEqual(optimal, halfSwap, 'refB=0 should return fallback');
-  console.log('✔ refB=0 (price at lower tick) → returns fallback safely');
+  const p = selectZapParams({
+    safeBalanceA: 9_000_000n, safeBalanceB: 9_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    envAmountA: '2500000',
+  });
+  assert.strictEqual(p.amountA, '2500000');
+  assert.strictEqual(p.amountB, '0');
+  assert.strictEqual(p.fixAmountA, true);
+  console.log('✔ TOKEN_A_AMOUNT env: used as sole input, B=0, SDK swaps internally');
 }
 
-// ── detectCorrectiveSwap ──────────────────────────────────────────────────
-
-// 6. Balanced amounts — no corrective swap needed
+// 6. TOKEN_B_AMOUNT env set: use it
 {
-  // refA=1000, refB=1000, amountA=500, amountB=500 → exact 1:1
-  const r = detectCorrectiveSwap(500n, 500n, 1000n, 1000n);
-  assert.ok(!r.needsSwap, 'Balanced amounts → no corrective swap');
-  console.log('✔ Balanced A and B → no corrective swap needed');
+  const p = selectZapParams({
+    safeBalanceA: 9_000_000n, safeBalanceB: 9_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    envAmountB: '1800000',
+  });
+  assert.strictEqual(p.amountA, '0');
+  assert.strictEqual(p.amountB, '1800000');
+  assert.strictEqual(p.fixAmountA, false);
+  console.log('✔ TOKEN_B_AMOUNT env: used as sole input, A=0, SDK swaps internally');
 }
 
-// 7. Excess A — swap some A→B
+// 7. Both env vars set: TOKEN_A_AMOUNT wins
 {
-  // refA=1000, refB=1000, amountA=8000000, amountB=2000000 → way too much A
-  const r = detectCorrectiveSwap(8_000_000n, 2_000_000n, 1000n, 1000n);
-  assert.ok(r.needsSwap, 'Excess A → needs corrective swap');
-  assert.strictEqual(r.aToB, true, 'Should swap A→B');
-  assert.ok(r.swapAmount !== undefined && r.swapAmount > 0n, 'Swap amount must be positive');
-  console.log(`✔ Excess A (8M A, 2M B, 1:1 ratio) → corrective swap A→B of ${r.swapAmount}`);
+  const p = selectZapParams({
+    safeBalanceA: 9_000_000n, safeBalanceB: 9_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    envAmountA: '3000000',
+    envAmountB: '7000000',
+  });
+  assert.strictEqual(p.amountA, '3000000', 'A env takes priority');
+  assert.strictEqual(p.amountB, '0');
+  assert.strictEqual(p.fixAmountA, true);
+  console.log('✔ Both env vars: TOKEN_A_AMOUNT takes priority');
 }
 
-// 8. Excess B — swap some B→A
+// ── Freed position amounts (rebalancing) ────────────────────────────────────
+
+// 8. Rebalancing (in-range new range): freed A available → use A
 {
-  // refA=1000, refB=1000, amountA=2000000, amountB=8000000 → way too much B
-  const r = detectCorrectiveSwap(2_000_000n, 8_000_000n, 1000n, 1000n);
-  assert.ok(r.needsSwap, 'Excess B → needs corrective swap');
-  assert.strictEqual(r.aToB, false, 'Should swap B→A');
-  assert.ok(r.swapAmount !== undefined && r.swapAmount > 0n, 'Swap amount must be positive');
-  console.log(`✔ Excess B (2M A, 8M B, 1:1 ratio) → corrective swap B→A of ${r.swapAmount}`);
+  const p = selectZapParams({
+    safeBalanceA: 10_000_000n, safeBalanceB: 10_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    closedPositionAmounts: { amountA: '5310014', amountB: '4200000' },
+  });
+  assert.strictEqual(p.amountA, '5310014', 'freed A used as zap input');
+  assert.strictEqual(p.amountB, '0', 'B must be 0 (single-token)');
+  assert.strictEqual(p.fixAmountA, true);
+  console.log('✔ Rebalancing in-range: freed A used as sole input (SDK handles ratio swap)');
 }
 
-// 9. Both tokens with A-biased ratio, amounts already match — no swap
+// 9. Rebalancing (above-range new range): freed B used
 {
-  // refA=3000, refB=1000. amountA=7500000, amountB=2500000 → ratio matches
-  const r = detectCorrectiveSwap(7_500_000n, 2_500_000n, 3000n, 1000n);
-  assert.ok(!r.needsSwap, 'Matching 3:1 ratio → no corrective swap');
-  console.log('✔ Amounts match A-biased ratio (3:1) → no corrective swap');
+  const p = selectZapParams({
+    safeBalanceA: 10_000_000n, safeBalanceB: 10_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: true,
+    closedPositionAmounts: { amountA: '5310014', amountB: '4200000' },
+  });
+  assert.strictEqual(p.amountA, '0');
+  assert.strictEqual(p.amountB, '4200000', 'freed B used as zap input (above-range)');
+  assert.strictEqual(p.fixAmountA, false);
+  console.log('✔ Rebalancing above-range: freed B used as sole input');
 }
 
-// 10. close_position returned both tokens from in-range close, ratio slightly off
+// 10. Rebalancing: freed A=0, freed B > 0 → use B
 {
-  // Closed position returned A=5M, B=5M (1:1).
-  // New position near upper tick needs ratio 1:4 (refA=1000, refB=4000).
-  // A is in excess → swap some A→B.
-  const r = detectCorrectiveSwap(5_000_000n, 5_000_000n, 1000n, 4000n);
-  assert.ok(r.needsSwap, 'In-range both tokens, wrong ratio → needs corrective swap');
-  assert.strictEqual(r.aToB, true, 'Should swap A→B (excess A)');
-  console.log(`✔ Both tokens from close_position (1:1 ratio, need 1:4) → corrective A→B swap of ${r.swapAmount}`);
+  const p = selectZapParams({
+    safeBalanceA: 10_000_000n, safeBalanceB: 10_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    closedPositionAmounts: { amountA: '0', amountB: '5310014' },
+  });
+  assert.strictEqual(p.amountA, '0');
+  assert.strictEqual(p.amountB, '5310014', 'only freed B available → use B');
+  assert.strictEqual(p.fixAmountA, false);
+  console.log('✔ Rebalancing: only freed B → uses B as sole zap input');
 }
 
-// ── determineFixAmountA (in-range: fix smaller) ───────────────────────────
-
-// 11. In-range: amountA < amountB → fix A (smaller)
+// 11. Rebalancing: freed A capped to safe wallet balance
 {
-  const fixA = determineFixAmountA(false, false, '2000000', '3000000');
-  assert.strictEqual(fixA, true, 'In-range, A smaller → fix A');
-  console.log('✔ In-range, A < B → fix A (smaller); SDK computes required B from A');
+  const p = selectZapParams({
+    safeBalanceA: 4_000_000n, safeBalanceB: 10_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    closedPositionAmounts: { amountA: '5000000', amountB: '3000000' },
+  });
+  // freed A=5M but wallet only has 4M → cap to 4M
+  assert.strictEqual(p.amountA, '4000000', 'freed A capped to safe wallet balance');
+  assert.strictEqual(p.amountB, '0');
+  assert.strictEqual(p.fixAmountA, true);
+  console.log('✔ Rebalancing: freed A capped to safe wallet balance');
 }
 
-// 12. In-range: amountA > amountB → fix B (smaller)
+// 12. Rebalancing: both freed=0 fallback (in-range) → A from wallet
 {
-  const fixA = determineFixAmountA(false, false, '3000000', '2000000');
-  assert.strictEqual(fixA, false, 'In-range, B smaller → fix B');
-  console.log('✔ In-range, A > B → fix B (smaller); SDK computes required A from B');
+  const p = selectZapParams({
+    safeBalanceA: 6_000_000n, safeBalanceB: 4_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: false,
+    closedPositionAmounts: { amountA: '0', amountB: '0' },
+  });
+  assert.strictEqual(p.amountA, '6000000', 'fallback to wallet A');
+  assert.strictEqual(p.amountB, '0');
+  assert.strictEqual(p.fixAmountA, true);
+  console.log('✔ Rebalancing: both freed=0 fallback → wallet A used as zap input');
 }
 
-// 13. In-range: equal amounts → fix A
+// 13. Rebalancing: both freed=0, above-range → B from wallet
 {
-  const fixA = determineFixAmountA(false, false, '2000000', '2000000');
-  assert.strictEqual(fixA, true, 'Equal → fix A (A <= B)');
-  console.log('✔ In-range, A == B → fix A');
+  const p = selectZapParams({
+    safeBalanceA: 6_000_000n, safeBalanceB: 4_000_000n,
+    priceIsBelowRange: false, priceIsAboveRange: true,
+    closedPositionAmounts: { amountA: '0', amountB: '0' },
+  });
+  assert.strictEqual(p.amountA, '0');
+  assert.strictEqual(p.amountB, '4000000', 'fallback to wallet B (above-range)');
+  assert.strictEqual(p.fixAmountA, false);
+  console.log('✔ Rebalancing: both freed=0, above-range fallback → wallet B used');
 }
 
-// 14. Below-range → always fix A (only token A needed)
+// ── fix_amount_a derivation ──────────────────────────────────────────────────
+
+// 14. fix_amount_a always matches which amount is non-zero
 {
-  const fixA = determineFixAmountA(true, false, '0', '5000000');
-  assert.strictEqual(fixA, true);
-  console.log('✔ Below-range → always fix A regardless of amounts');
+  const cases: Array<[string, string, boolean]> = [
+    ['1000', '0', true],
+    ['0', '2000', false],
+    ['999999', '0', true],
+    ['0', '1', false],
+  ];
+  for (const [a, b, expected] of cases) {
+    const fixA = BigInt(a) > 0n;
+    assert.strictEqual(fixA, expected, `fix_amount_a for (${a},${b})`);
+  }
+  console.log('✔ fix_amount_a = BigInt(amountA) > 0n is always consistent with non-zero token');
 }
 
-// 15. Above-range → always fix B (only token B needed)
-{
-  const fixA = determineFixAmountA(false, true, '5000000', '0');
-  assert.strictEqual(fixA, false);
-  console.log('✔ Above-range → always fix B regardless of amounts');
-}
+console.log('\n=== Design Summary ===');
+console.log('The Cetus SDK zap-in requires only ONE token as input:');
+console.log('  - fix_amount_a=true  → amountA is the full zap input, amountB="0"');
+console.log('  - fix_amount_a=false → amountB is the full zap input, amountA="0"');
+console.log('The SDK internally swaps the correct portion and adds liquidity.');
+console.log('No manual pre-swap or ratio calculation is needed in the bot.');
 
-// ── Specific failing scenario from the issue ─────────────────────────────
-
-// 16. close_position returned only B=5310014 for in-range new position.
-//     Old behavior: swap exactly half → adjB=2655007, fix A (>= B), SDK needs
-//     2655007 B but balance is slightly less → "Insufficient balance".
-//     New behavior: optimal swap based on pool ratio ensures correct split.
-{
-  // Assume 1:1 price and 1:1 pool ratio for this simulation.
-  const totalB = 5_310_014n;
-  const halfSwap = totalB / 2n;            // 2655007 (old naive amount)
-  const estimatedOut = halfSwap;           // 1:1 rate
-  const refA = 1000n, refB = 1000n;        // balanced in-range position
-
-  const optimal = computeOptimalZapSwapAmount(
-    totalB, false, estimatedOut, halfSwap, refA, refB, halfSwap,
-  );
-
-  // With 1:1 price and 1:1 ratio the optimal == half (no difference in this
-  // case, but the key fix is the fresh balance re-query afterwards).
-  const adjA = optimal;                    // A received from swap
-  const adjB = totalB - optimal;          // B remaining
-
-  // Post-swap fix_amount_a: fix SMALLER of (adjA, adjB)
-  const fixAmountA = determineFixAmountA(false, false, adjA.toString(), adjB.toString());
-
-  // When adjA == adjB (1:1 price): fixAmountA = true (A <= B with equal)
-  // SDK fixes A, requires B = adjA * (refB/refA) = adjA (1:1 ratio) = adjB → EXACT match → OK
-  assert.ok(adjA > 0n && adjB > 0n, 'Both tokens present after swap');
-  console.log(
-    `✔ Failing scenario: totalB=${totalB}, optimalSwap=${optimal}, adjA=${adjA}, adjB=${adjB}, fixA=${fixAmountA}`,
-  );
-  console.log('  → Fresh wallet re-query ensures accurate adjA/adjB; fixAmountA on smaller prevents Insufficient Balance');
-}
-
-console.log('\nAll zap-in optimal swap tests passed ✅');
+console.log('\nAll single-token zap-in tests passed ✅');
