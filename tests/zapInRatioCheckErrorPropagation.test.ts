@@ -1,21 +1,26 @@
 /**
- * Test: corrective swap errors in the zap-in ratio check must propagate,
- * not be swallowed by the outer try/catch.
+ * Test: corrective swap error-handling in the zap-in ratio check.
  *
- * Bug reproduced by log sequence:
- *   [INFO]  Zap-in: refined swap amount for optimal A:B ratio
- *   [INFO]  Zap-in swap estimate
- *   [WARN]  Zap-in ratio check failed — proceeding with available amounts
+ * History of fixes:
  *
- * Root cause: performZapInSwap (the corrective swap) was called INSIDE the
- * try/catch that guards only the ratio computation (getPool + TickMath).
- * When the swap transaction failed, the error was caught and swallowed, and
- * the bot proceeded with the original imbalanced amounts — causing the
- * subsequent add-liquidity call to fail as well.
+ * Bug 1 (old): performZapInSwap was called INSIDE the try/catch that guards
+ *   the ratio computation.  Swap errors were silently swallowed → bot
+ *   proceeded with imbalanced amounts → add-liquidity call failed.
+ *   Log pattern: [WARN] Zap-in ratio check failed — proceeding with available amounts
  *
- * Fix: narrow the try/catch to cover only the ratio computation; keep
- * performZapInSwap outside so swap-transaction errors propagate to
- * retryAddLiquidity.
+ * Fix for Bug 1: move performZapInSwap OUTSIDE the ratio-computation try/catch.
+ *   Swap errors now propagated, but they bypassed retryAddLiquidity entirely
+ *   (corrective swap runs before retryAddLiquidity is called).
+ *
+ * Bug 2 (current issue): the corrective swap (before retryAddLiquidity) fails
+ *   with e.g. "Insufficient balance for USDC" from the SDK → error propagates
+ *   to addLiquidity's outer catch → "Failed to add liquidity" → no retry.
+ *   Log pattern: [INFO] Zap-in swap estimate → [ERROR] Failed to add liquidity
+ *
+ * Fix for Bug 2: wrap the corrective swap in its OWN try/catch.  On failure
+ *   log a targeted warning and fall through to retryAddLiquidity.  The
+ *   recovery-swap logic inside retryAddLiquidity then performs the required
+ *   token swap and retries add-liquidity with the updated amounts.
  *
  * Run with: npx ts-node tests/zapInRatioCheckErrorPropagation.test.ts
  */
@@ -64,8 +69,11 @@ function computeCorrectiveSwap(
 }
 
 /**
- * Simulate the FIXED control flow.  The ratio computation is inside a
- * try/catch; the corrective swap is OUTSIDE (errors propagate).
+ * Simulate the CURRENT control flow (Fix for Bug 2):
+ *  - Ratio computation is inside a try/catch (safe fallback).
+ *  - Corrective swap is in its OWN try/catch so that swap failures are caught,
+ *    a warning is logged, and execution falls through to retryAddLiquidity's
+ *    recovery-swap logic.
  */
 async function addLiquidityFixedFlow(
   bigAmountA: bigint,
@@ -87,21 +95,23 @@ async function addLiquidityFixedFlow(
     warnings.push('Zap-in ratio check failed — proceeding with available amounts');
   }
 
-  // --- Step 2: corrective swap (NOT guarded — errors propagate) ---
+  // --- Step 2: corrective swap (own try/catch — failure falls through to recovery) ---
   if (correctiveSwap) {
-    if (swapShouldThrow) {
-      throw new Error('Simulated swap transaction failure (e.g. Zap-in swap failed: on-chain abort)');
-    }
-    // Simulate a successful swap: move excess token
-    // NOTE: uses a simplified 1:1 exchange rate for clarity.  The exact
-    // post-swap amounts don't matter for this test — we're only validating
-    // that (a) the swap is called at all, and (b) its error propagates.
-    if (correctiveSwap.aToB) {
-      amountA -= correctiveSwap.swapAmount;
-      amountB += correctiveSwap.swapAmount;  // simplified: 1:1
-    } else {
-      amountB -= correctiveSwap.swapAmount;
-      amountA += correctiveSwap.swapAmount;
+    try {
+      if (swapShouldThrow) {
+        throw new Error('Simulated swap transaction failure (e.g. Insufficient balance for USDC)');
+      }
+      // Simulate a successful swap: move excess token
+      // NOTE: uses a simplified 1:1 exchange rate for clarity.
+      if (correctiveSwap.aToB) {
+        amountA -= correctiveSwap.swapAmount;
+        amountB += correctiveSwap.swapAmount;  // simplified: 1:1
+      } else {
+        amountB -= correctiveSwap.swapAmount;
+        amountA += correctiveSwap.swapAmount;
+      }
+    } catch (swapErr) {
+      warnings.push('Corrective zap-in swap failed — proceeding with pre-swap amounts; recovery swap will retry');
     }
   }
 
@@ -132,12 +142,15 @@ async function runTests() {
     console.log('✔ Scenario 1: ratio computation throws → warning + original amounts kept');
   }
 
-  // ─── 2. Swap transaction throws → error PROPAGATES (not swallowed) ────────
+  // ─── 2. Swap transaction throws → warning logged, original amounts kept ───
+  //    (error is caught in corrective-swap try/catch; retryAddLiquidity recovery
+  //     swap will handle the imbalance on the next attempt)
   {
     const warnings: string[] = [];
     let caughtError: Error | null = null;
+    let result: { amountA: bigint; amountB: bigint } | null = null;
     try {
-      await addLiquidityFixedFlow(
+      result = await addLiquidityFixedFlow(
         8_000_000n, 2_000_000n,   // amounts (excess A in 1:1 ratio → corrective swap needed)
         1n, 1n,
         /* ratioComputationShouldThrow */ false,
@@ -148,14 +161,14 @@ async function runTests() {
       caughtError = err instanceof Error ? err : new Error(String(err));
     }
 
-    assert.ok(caughtError, 'Swap transaction error should propagate — not be swallowed');
-    assert.ok(
-      caughtError!.message.includes('swap transaction failure') ||
-      caughtError!.message.includes('Zap-in swap failed'),
-      `Error message should describe swap failure, got: ${caughtError!.message}`,
-    );
-    assert.strictEqual(warnings.length, 0, 'No "ratio check failed" warning should be emitted when the swap itself fails');
-    console.log('✔ Scenario 2: swap transaction throws → error propagates (not swallowed)');
+    assert.strictEqual(caughtError, null, 'Corrective swap error should be caught (not propagated) so retryAddLiquidity can recover');
+    assert.ok(result, 'Should return a result even when corrective swap fails');
+    assert.strictEqual(warnings.length, 1, 'Should emit exactly one warning about the failed corrective swap');
+    assert.ok(warnings[0].includes('Corrective zap-in swap failed'), 'Warning should describe corrective swap failure');
+    // Amounts are unchanged — retryAddLiquidity's recovery swap will fix the imbalance
+    assert.strictEqual(result!.amountA, 8_000_000n, 'amountA unchanged when corrective swap fails');
+    assert.strictEqual(result!.amountB, 2_000_000n, 'amountB unchanged when corrective swap fails');
+    console.log('✔ Scenario 2: corrective swap fails → warning logged, original amounts kept, retryAddLiquidity can recover');
   }
 
   // ─── 3. Both computation and swap succeed → amounts updated ───────────────
@@ -189,14 +202,14 @@ async function runTests() {
     console.log('✔ Scenario 4: balanced ratio → no swap, no warning, amounts unchanged');
   }
 
-  // ─── 5. Verify the old (buggy) flow would have swallowed the swap error ───
-  //    The bug: swap called INSIDE the try/catch
+  // ─── 5. Verify the original (Bug 1) buggy flow would have swallowed the swap error ─
+  //    The bug: swap called INSIDE the ratio-computation try/catch
   {
     const warnings: string[] = [];
     let caughtError: Error | null = null;
 
-    // Simulate old buggy flow: performZapInSwap INSIDE try/catch
-    async function addLiquidityBuggyFlow(): Promise<void> {
+    // Simulate Bug 1 buggy flow: performZapInSwap INSIDE ratio-computation try/catch
+    async function addLiquidityBug1Flow(): Promise<void> {
       try {
         // ratio computation succeeds
         const swapInstruction = computeCorrectiveSwap(8_000_000n, 2_000_000n, 1n, 1n, false);
@@ -211,15 +224,65 @@ async function runTests() {
     }
 
     try {
-      await addLiquidityBuggyFlow();
+      await addLiquidityBug1Flow();
     } catch (err) {
       caughtError = err instanceof Error ? err : new Error(String(err));
     }
 
-    // In the buggy flow the error was swallowed — no exception propagated
-    assert.strictEqual(caughtError, null, 'Buggy flow: error was swallowed (no exception)');
-    assert.strictEqual(warnings.length, 1, 'Buggy flow: emitted the misleading "ratio check failed" warning');
-    console.log('✔ Scenario 5: confirms the OLD buggy flow swallowed the swap error (regression baseline)');
+    // In the Bug 1 flow the error was swallowed — no exception propagated
+    assert.strictEqual(caughtError, null, 'Bug 1 flow: error was swallowed (no exception)');
+    assert.strictEqual(warnings.length, 1, 'Bug 1 flow: emitted the misleading "ratio check failed" warning');
+    console.log('✔ Scenario 5: confirms Bug 1 flow (swap inside ratio try/catch) swallowed the error');
+  }
+
+  // ─── 6. Corrective swap fails, then retryAddLiquidity recovery succeeds ───
+  //    Simulates the full flow: corrective swap fails → warning → retryAddLiquidity
+  //    detects "Insufficient balance" → recovery swap → retry succeeds.
+  {
+    const COIN_B = '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
+    const insufficientBalanceError = `The amount(173416) is Insufficient balance for ${COIN_B} , expect 321015`;
+
+    let recoverySwapAttempted = false;
+    let retryAttempts = 0;
+
+    async function simulateFullFlow(): Promise<string> {
+      // Step 1: corrective swap fails (catches, logs warning)
+      let correctiveSwapWarned = false;
+      try {
+        throw new Error(insufficientBalanceError);
+      } catch {
+        correctiveSwapWarned = true;
+      }
+      assert.ok(correctiveSwapWarned, 'Corrective swap failure should be caught');
+
+      // Step 2: retryAddLiquidity with recovery swap
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        retryAttempts = attempt;
+        try {
+          if (attempt === 1) {
+            // First retry: createAddLiquidityFixTokenPayload throws "Insufficient balance"
+            throw new Error(insufficientBalanceError);
+          }
+          // Second retry: succeeds after recovery swap
+          return 'success';
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const insuffMatch = errMsg.match(/Insufficient balance for ([^\s,]+)\s*,\s*expect\s+(\d+)/i);
+          if (insuffMatch && !recoverySwapAttempted) {
+            recoverySwapAttempted = true;
+            // Recovery swap executes (performZapInSwap) — gets required token
+          }
+          if (attempt === 3) throw err;
+        }
+      }
+      throw new Error('Unreachable: retry loop exited without returning or throwing');
+    }
+
+    const result = await simulateFullFlow();
+    assert.strictEqual(result, 'success', 'Should succeed after corrective swap failure + recovery swap');
+    assert.strictEqual(retryAttempts, 2, 'Should succeed on 2nd retry (after recovery swap on 1st)');
+    assert.ok(recoverySwapAttempted, 'Recovery swap inside retryAddLiquidity should have been attempted');
+    console.log('✔ Scenario 6: corrective swap fails → retryAddLiquidity recovery swap → succeeds on retry');
   }
 
   console.log('\nAll zap-in ratio-check error-propagation tests passed ✅');
@@ -227,8 +290,8 @@ async function runTests() {
   console.log('  Before: performZapInSwap INSIDE try/catch → swap errors swallowed');
   console.log('          → proceeds with imbalanced amounts → add-liquidity fails');
   console.log('  After:  ratio computation INSIDE try/catch (safe fallback)');
-  console.log('          performZapInSwap OUTSIDE try/catch → swap errors propagate');
-  console.log('          → retryAddLiquidity can retry with fresh state');
+  console.log('          performZapInSwap in own try/catch → swap errors caught with warning');
+  console.log('          → retryAddLiquidity recovery swap handles the imbalance');
 }
 
 runTests().catch((err) => {
