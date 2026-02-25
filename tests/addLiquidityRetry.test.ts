@@ -53,11 +53,13 @@ async function retryAddLiquidity<T>(
 
       // MoveAbort errors are contract-level failures that cannot be resolved
       // by retrying with the same parameters — throw immediately.
-      // Exception: add_liquidity_fix_coin aborting with code 0 (delta_liquidity == 0)
-      // may be caused by severely imbalanced token amounts after a failed corrective
-      // swap; the recovery-swap inside the operation will rebalance them on the next retry.
+      // Exception: MoveAbort code 0 from repay_add_liquidity or
+      // add_liquidity_fix_coin indicates zero liquidity was calculated, which
+      // can be caused by stale balance amounts. The retry refetches and
+      // re-caps balances, so subsequent attempts may succeed.
       if (errorMsg.includes('MoveAbort') &&
-          !(errorMsg.includes('add_liquidity_fix_coin') && /,\s*0\s*\)/.test(errorMsg))) {
+          !(/,\s*0\s*\)/.test(errorMsg) &&
+            (errorMsg.includes('repay_add_liquidity') || errorMsg.includes('add_liquidity_fix_coin')))) {
         mockLogger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
         throw error;
       }
@@ -213,12 +215,44 @@ async function runTests() {
     console.log('✔ Add liquidity uses correct retry parameters');
   }
 
-  // Test 6: MoveAbort errors are thrown immediately without retrying
+  // Test 6: repay_add_liquidity code 0 (zero liquidity) is retryable — not thrown immediately
+  {
+    mockLogger.clearLogs();
+    let callCount = 0;
+    const repayAbortError = new Error(
+      'MoveAbort(MoveLocation { module: ModuleId { address: b2db71..., name: Identifier("pool_script_v2") }, function: 23, instruction: 16, function_name: Some("repay_add_liquidity") }, 0) in command 1'
+    );
+
+    try {
+      await retryAddLiquidity(async () => {
+        callCount++;
+        throw repayAbortError;
+      }, 3, 10);
+      assert.fail('Should have thrown error after max retries');
+    } catch (error) {
+      assert.strictEqual(error, repayAbortError, 'Should re-throw the original error after retries');
+      assert.strictEqual(callCount, 3, 'Should retry all 3 attempts (not throw immediately)');
+
+      const abortLog = mockLogger.logs.find(
+        (log) => log.level === 'error' && log.message.includes('Non-retryable MoveAbort error')
+      );
+      assert.ok(!abortLog, 'Should NOT log non-retryable MoveAbort for repay_add_liquidity code 0');
+
+      const retryLog = mockLogger.logs.find(
+        (log) => log.level === 'warn' && log.message.includes('failed, retrying')
+      );
+      assert.ok(retryLog, 'Should log retry warning for repay_add_liquidity code 0');
+    }
+
+    console.log('✔ repay_add_liquidity code 0 (zero liquidity) is retried, not thrown immediately');
+  }
+
+  // Test 6b: Non-zero MoveAbort errors (code != 0) are thrown immediately without retrying
   {
     mockLogger.clearLogs();
     let callCount = 0;
     const moveAbortError = new Error(
-      'MoveAbort(MoveLocation { module: ModuleId { address: b2db71..., name: Identifier("pool_script_v2") }, function: 23, instruction: 16, function_name: Some("repay_add_liquidity") }, 0) in command 1'
+      'MoveAbort(MoveLocation { module: ModuleId { address: b2db71..., name: Identifier("pool_script_v2") }, function: 23, instruction: 16, function_name: Some("repay_add_liquidity") }, 1) in command 1'
     );
 
     try {
@@ -229,7 +263,7 @@ async function runTests() {
       assert.fail('Should have thrown MoveAbort error immediately');
     } catch (error) {
       assert.strictEqual(error, moveAbortError, 'Should re-throw the original MoveAbort error');
-      assert.strictEqual(callCount, 1, 'Should only attempt once — no retries on MoveAbort');
+      assert.strictEqual(callCount, 1, 'Should only attempt once — no retries on non-zero MoveAbort');
 
       const abortLog = mockLogger.logs.find(
         (log) => log.level === 'error' && log.message.includes('Non-retryable MoveAbort error')
@@ -239,10 +273,10 @@ async function runTests() {
       const retryLog = mockLogger.logs.find(
         (log) => log.level === 'warn' && log.message.includes('failed, retrying')
       );
-      assert.ok(!retryLog, 'Should NOT log any retry warning for MoveAbort');
+      assert.ok(!retryLog, 'Should NOT log any retry warning for non-zero MoveAbort');
     }
 
-    console.log('✔ MoveAbort errors are thrown immediately without retrying');
+    console.log('✔ Non-zero MoveAbort errors are thrown immediately without retrying');
   }
 
   // Test 7: add_liquidity_fix_coin code 0 (zero liquidity) is retryable — not thrown immediately
