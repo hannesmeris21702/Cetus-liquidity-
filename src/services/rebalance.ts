@@ -1047,19 +1047,24 @@ export class RebalanceService {
       let amountB: string;
 
       // Env-configured token amounts take priority over closed-position amounts
-      // and wallet balance.  When TOKEN_A_AMOUNT or TOKEN_B_AMOUNT are set the
-      // bot uses exactly those values for the new position regardless of what was
-      // freed from the old one.
-      // Note: either or both amounts may be set independently.  A zero amount for
-      // one side is valid for out-of-range (single-sided) positions.  When the
-      // position is in-range and only one token is provided, the existing zap-in
-      // swap logic (below) will automatically swap half to obtain both tokens.
+      // and wallet balance.  Single-sided input is supported: set either
+      // TOKEN_A_AMOUNT or TOKEN_B_AMOUNT (but not both).  When both are provided,
+      // TOKEN_A_AMOUNT is preferred and TOKEN_B_AMOUNT is ignored.  The zap-in
+      // swap logic below will convert the fixed token into the correct ratio for
+      // in-range positions automatically.
       const envAmountA = this.config.tokenAAmount;
       const envAmountB = this.config.tokenBAmount;
-      if (envAmountA || envAmountB) {
-        amountA = envAmountA || '0';
-        amountB = envAmountB || '0';
-        logger.info('Using env-configured token amounts for new position', { amountA, amountB });
+      if (envAmountA) {
+        // TOKEN_A_AMOUNT is set: use it as the sole input.
+        // When both vars are configured, TOKEN_A_AMOUNT takes priority.
+        amountA = envAmountA;
+        amountB = '0';
+        logger.info('Using TOKEN_A_AMOUNT for new position', { amountA });
+      } else if (envAmountB) {
+        // Only TOKEN_B_AMOUNT is set: use it as the sole input.
+        amountA = '0';
+        amountB = envAmountB;
+        logger.info('Using TOKEN_B_AMOUNT for new position', { amountB });
       } else if (closedPositionAmounts) {
         const removedA = BigInt(closedPositionAmounts.amountA);
         const removedB = BigInt(closedPositionAmounts.amountB);
