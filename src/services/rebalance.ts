@@ -620,7 +620,13 @@ export class RebalanceService {
         
         // MoveAbort errors are contract-level failures that cannot be resolved
         // by retrying with the same parameters — throw immediately.
-        if (errorMsg.includes('MoveAbort')) {
+        // Exception: MoveAbort code 0 from repay_add_liquidity or
+        // add_liquidity_fix_coin indicates zero liquidity was calculated, which
+        // can be caused by stale balance amounts. The retry refetches and
+        // re-caps balances, so subsequent attempts may succeed.
+        if (errorMsg.includes('MoveAbort') &&
+            !(/,\s*0\s*\)/.test(errorMsg) &&
+              (errorMsg.includes('repay_add_liquidity') || errorMsg.includes('add_liquidity_fix_coin')))) {
           logger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
           throw error;
         }
