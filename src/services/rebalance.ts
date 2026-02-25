@@ -4,8 +4,6 @@ import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
 import type { BalanceChange } from '@mysten/sui/client';
-import type { SwapParams } from '@cetusprotocol/cetus-sui-clmm-sdk';
-import { TickMath, getCoinAFromLiquidity, getCoinBFromLiquidity } from '@cetusprotocol/cetus-sui-clmm-sdk';
 
 export interface RebalanceResult {
   success: boolean;
@@ -56,9 +54,6 @@ export class RebalanceService {
   private config: BotConfig;
   private dryRun: boolean;
   private trackedPositionId: string | null;
-
-  // Scale factor for bigint slippage arithmetic (basis points denominator).
-  private static readonly SLIPPAGE_SCALE = 10_000n;
 
   constructor(
     sdkService: CetusSDKService,
@@ -625,11 +620,7 @@ export class RebalanceService {
         
         // MoveAbort errors are contract-level failures that cannot be resolved
         // by retrying with the same parameters — throw immediately.
-        // Exception: add_liquidity_fix_coin aborting with code 0 (delta_liquidity == 0)
-        // may be caused by severely imbalanced token amounts after a failed corrective
-        // swap; the recovery-swap inside the operation will rebalance them on the next retry.
-        if (errorMsg.includes('MoveAbort') &&
-            !(errorMsg.includes('add_liquidity_fix_coin') && /,\s*0\s*\)/.test(errorMsg))) {
+        if (errorMsg.includes('MoveAbort')) {
           logger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
           throw error;
         }
@@ -714,241 +705,9 @@ export class RebalanceService {
   }
 
   /**
-   * Compute the optimal amount of the input token to swap so that, after the
-   * swap, the resulting A:B ratio matches what the in-range position requires.
+   * Add liquidity using the SDK's fix-token (zap) method.
    *
-   * Uses the position's tick bounds together with the pre-swap exchange-rate
-   * estimate to solve for X exactly:
-   *
-   *   B→A (aToB=false): X = refA × total × E_denom / (E_numer × refB + refA × E_denom)
-   *   A→B (aToB=true):  X = refB × total × E_denom / (refA × E_numer + refB × E_denom)
-   *
-   * Where E_numer/E_denom is the exchange rate from the preswap estimate
-   * (estimatedAmountOut / swapAmountForEstimate) and refA/refB are the
-   * required token amounts per unit of liquidity at the current pool price.
-   *
-   * Falls back to `fallbackAmount` (≈ half) on any error.
-   */
-  private computeOptimalZapSwapAmount(
-    totalInput: bigint,
-    aToB: boolean,
-    estimatedOut: bigint,
-    swapAmountForEstimate: bigint,
-    sqrtPriceCurrent: BN,
-    tickLower: number,
-    tickUpper: number,
-    fallbackAmount: bigint,
-  ): bigint {
-    try {
-      const sqrtPriceLower = TickMath.tickIndexToSqrtPriceX64(tickLower);
-      const sqrtPriceUpper = TickMath.tickIndexToSqrtPriceX64(tickUpper);
-
-      // Reference liquidity — any non-zero constant works; we only use the ratio.
-      const REF_LIQ = new BN('1' + '0'.repeat(18));
-
-      // A required for REF_LIQ: function of (current, upper) prices
-      const refABN = getCoinAFromLiquidity(REF_LIQ, sqrtPriceCurrent, sqrtPriceUpper, false);
-      // B required for REF_LIQ: function of (lower, current) prices
-      const refBBN = getCoinBFromLiquidity(REF_LIQ, sqrtPriceLower, sqrtPriceCurrent, false);
-
-      if (refABN.isZero() || refBBN.isZero()) return fallbackAmount;
-
-      const refA = BigInt(refABN.toString());
-      const refB = BigInt(refBBN.toString());
-      const E_numer = estimatedOut;
-      const E_denom = swapAmountForEstimate;
-
-      let numerator: bigint;
-      let denominator: bigint;
-
-      if (aToB) {
-        // Swapping A → B: X = refB × total × E_denom / (refA × E_numer + refB × E_denom)
-        numerator = refB * totalInput * E_denom;
-        denominator = refA * E_numer + refB * E_denom;
-      } else {
-        // Swapping B → A: X = refA × total × E_denom / (E_numer × refB + refA × E_denom)
-        numerator = refA * totalInput * E_denom;
-        denominator = E_numer * refB + refA * E_denom;
-      }
-
-      if (denominator === 0n) return fallbackAmount;
-
-      const optimalX = numerator / denominator;
-
-      // Sanity check: must be a positive fraction of totalInput
-      if (optimalX <= 0n || optimalX >= totalInput) return fallbackAmount;
-
-      return optimalX;
-    } catch (err) {
-      logger.warn('Optimal zap-in swap calculation failed, using fallback amount', { error: err });
-      return fallbackAmount;
-    }
-  }
-
-
-  /**
-   * Perform a swap of the input token so that both tokens are available for
-   * adding to an in-range position (zap in).
-   *
-   * @param poolInfo   - pool metadata
-   * @param aToB       - true = swap tokenA → tokenB, false = swap tokenB → tokenA
-   * @param swapAmount - initial estimate of the input token to swap (≈ half of total);
-   *                     refined internally using the preswap estimate and tick math when
-   *                     tickLower/tickUpper are supplied.
-   * @param preSwapA   - tokenA amount BEFORE the swap (used only for logging context)
-   * @param preSwapB   - tokenB amount BEFORE the swap (used only for logging context)
-   * @param tickLower  - (optional) position lower tick; enables optimal-split calculation
-   * @param tickUpper  - (optional) position upper tick; enables optimal-split calculation
-   * @returns updated { amountA, amountB } to use for the addLiquidity call
-   */
-  private async performZapInSwap(
-    poolInfo: PoolInfo,
-    aToB: boolean,
-    swapAmount: bigint,
-    preSwapA: bigint,
-    preSwapB: bigint,
-    tickLower?: number,
-    tickUpper?: number,
-  ): Promise<{ amountA: string; amountB: string }> {
-    const sdk = this.sdkService.getSdk();
-    const keypair = this.sdkService.getKeypair();
-    const suiClient = this.sdkService.getSuiClient();
-    const ownerAddress = this.sdkService.getAddress();
-
-    logger.info('Zap-in: performing pre-swap to obtain both tokens', {
-      aToB,
-      swapAmount: swapAmount.toString(),
-    });
-
-    // Estimate the swap output to set a meaningful amount_limit (min out with
-    // slippage) and — when tick bounds are provided — to compute the optimal
-    // swap amount that achieves the required A:B ratio for the position.
-    let amountLimit = '0';
-    try {
-      const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
-      const preswapResult = await sdk.Swap.preswap({
-        pool,
-        currentSqrtPrice: pool.current_sqrt_price,
-        coinTypeA: poolInfo.coinTypeA,
-        coinTypeB: poolInfo.coinTypeB,
-        decimalsA: 9,
-        decimalsB: 9,
-        a2b: aToB,
-        byAmountIn: true,
-        amount: swapAmount.toString(),
-      });
-      if (preswapResult && !preswapResult.isExceed) {
-        const estimatedOut = BigInt(preswapResult.estimatedAmountOut);
-
-        // When tick bounds are provided, refine swapAmount to the optimal value
-        // that will yield the correct A:B ratio for the new position.  The
-        // preswap exchange-rate (estimatedOut / swapAmount) serves as the price.
-        if (tickLower !== undefined && tickUpper !== undefined) {
-          const totalInput = aToB ? preSwapA : preSwapB;
-          const optimal = this.computeOptimalZapSwapAmount(
-            totalInput,
-            aToB,
-            estimatedOut,
-            swapAmount,
-            new BN(pool.current_sqrt_price),
-            tickLower,
-            tickUpper,
-            swapAmount,  // fallback = original estimate
-          );
-          if (optimal !== swapAmount) {
-            logger.info('Zap-in: refined swap amount for optimal A:B ratio', {
-              original: swapAmount.toString(),
-              optimal: optimal.toString(),
-            });
-            // Approximate amountLimit for the optimal amount by linear scaling
-            // of the preswap estimate.  For small changes in swap amount this
-            // is accurate enough; a lower amountLimit (closer to 0) is also
-            // acceptable since it simply widens the slippage window slightly.
-            const scaledEstimate = (estimatedOut * optimal) / swapAmount;
-            const slippageFactor = BigInt(Math.floor((1 - this.config.maxSlippage) * Number(RebalanceService.SLIPPAGE_SCALE)));
-            amountLimit = ((scaledEstimate * slippageFactor) / RebalanceService.SLIPPAGE_SCALE).toString();
-            swapAmount = optimal;
-          } else {
-            // Optimal equals original estimate — still set amountLimit.
-            const slippageFactor = BigInt(Math.floor((1 - this.config.maxSlippage) * Number(RebalanceService.SLIPPAGE_SCALE)));
-            amountLimit = ((estimatedOut * slippageFactor) / RebalanceService.SLIPPAGE_SCALE).toString();
-          }
-        } else {
-          // No tick bounds — just use estimate for amountLimit.
-          const slippageFactor = BigInt(Math.floor((1 - this.config.maxSlippage) * Number(RebalanceService.SLIPPAGE_SCALE)));
-          amountLimit = ((estimatedOut * slippageFactor) / RebalanceService.SLIPPAGE_SCALE).toString();
-        }
-
-        logger.info('Zap-in swap estimate', {
-          estimatedAmountOut: preswapResult.estimatedAmountOut,
-          finalSwapAmount: swapAmount.toString(),
-          amountLimit,
-        });
-      }
-    } catch (err) {
-      logger.warn('Zap-in preswap estimate failed — proceeding with amount_limit=0', { error: err });
-    }
-
-    // Build and execute the swap transaction.
-    const swapParams: SwapParams = {
-      pool_id: poolInfo.poolAddress,
-      coinTypeA: poolInfo.coinTypeA,
-      coinTypeB: poolInfo.coinTypeB,
-      a2b: aToB,
-      by_amount_in: true,
-      amount: swapAmount.toString(),
-      amount_limit: amountLimit,
-    };
-
-    const swapPayload = await sdk.Swap.createSwapTransactionPayload(swapParams);
-    swapPayload.setGasBudget(this.config.gasBudget);
-
-    const swapResult = await suiClient.signAndExecuteTransaction({
-      transaction: swapPayload,
-      signer: keypair,
-      options: { showEffects: true, showBalanceChanges: true },
-    });
-
-    if (swapResult.effects?.status?.status !== 'success') {
-      throw new Error(`Zap-in swap failed: ${swapResult.effects?.status?.error || 'Unknown error'}`);
-    }
-
-    logger.info('Zap-in swap executed', { digest: swapResult.digest });
-
-    // Always re-query the actual wallet balances after the swap.
-    // Computing amounts from balance-change deltas can overestimate the
-    // available balance (e.g. when preSwapB came from closedPositionAmounts
-    // rather than the live wallet balance), which would cause the subsequent
-    // addLiquidity call to fail with "Insufficient balance".
-    const SUI_GAS_RESERVE = BigInt(this.config.gasBudget);
-    const SUI_TYPE = '0x2::sui::SUI';
-    const SUI_TYPE_FULL = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
-    const isSuiCoinType = (ct: string) => ct === SUI_TYPE || ct === SUI_TYPE_FULL;
-
-    logger.info('Zap-in swap: re-querying wallet balances for accuracy');
-    const [freshBalA, freshBalB] = await Promise.all([
-      suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
-      suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
-    ]);
-    let adjA = BigInt(freshBalA.totalBalance);
-    let adjB = BigInt(freshBalB.totalBalance);
-
-    // Reserve gas when a token is SUI.
-    if (isSuiCoinType(poolInfo.coinTypeA) && adjA > SUI_GAS_RESERVE) adjA -= SUI_GAS_RESERVE;
-    if (isSuiCoinType(poolInfo.coinTypeB) && adjB > SUI_GAS_RESERVE) adjB -= SUI_GAS_RESERVE;
-
-    const amountA = (adjA > 0n ? adjA : 0n).toString();
-    const amountB = (adjB > 0n ? adjB : 0n).toString();
-
-    logger.info('Zap-in swap complete — updated token amounts', { amountA, amountB });
-    return { amountA, amountB };
-  }
-
-
-   /**
-    * Add liquidity using the SDK's fix-token (zap) method.
-    *
-    * When closedPositionAmounts are provided (rebalancing case) the method uses
+   * When closedPositionAmounts are provided (rebalancing case) the method uses
    * those freed token amounts as the zap inputs instead of the full wallet
    * balance.  This ensures the new position is funded exclusively by the
    * liquidity that was released from the closed out-of-range position:
@@ -959,16 +718,6 @@ export class RebalanceService {
    *
    * When no closedPositionAmounts are given (new position from scratch) the
    * wallet-balance logic applies for all range configurations.
-   *
-   * Token conversion (zap) logic — applied after amounts are determined:
-   *
-   *  - In-range position with only one token → swap ≈ half to obtain both tokens
-   *  - Below-range position with only token B → swap all B → A (correct token for range)
-   *  - Above-range position with only token A → swap all A → B (correct token for range)
-   *
-   * This ensures the bot correctly handles close_position returning either
-   * token A or token B (depending on which side of the range the price moved to)
-   * and converts it to whatever the new position requires.
    */
   private async addLiquidity(
     poolInfo: PoolInfo,
@@ -1049,9 +798,7 @@ export class RebalanceService {
       // Env-configured token amounts take priority over closed-position amounts
       // and wallet balance.  Single-sided input is supported: set either
       // TOKEN_A_AMOUNT or TOKEN_B_AMOUNT (but not both).  When both are provided,
-      // TOKEN_A_AMOUNT is preferred and TOKEN_B_AMOUNT is ignored.  The zap-in
-      // swap logic below will convert the fixed token into the correct ratio for
-      // in-range positions automatically.
+      // TOKEN_A_AMOUNT is preferred and TOKEN_B_AMOUNT is ignored.
       const envAmountA = this.config.tokenAAmount;
       const envAmountB = this.config.tokenBAmount;
       if (envAmountA) {
@@ -1087,21 +834,16 @@ export class RebalanceService {
             safeBalanceA: safeBalanceA.toString(),
             safeBalanceB: safeBalanceB.toString(),
           });
-          // Use both balances regardless of range — the wrong-token swap below
-          // will convert whichever token was actually received if needed.
           amountA = safeBalanceA.toString();
           amountB = safeBalanceB.toString();
         }
       } else if (priceIsBelowRange) {
-        // Below-range position primarily needs token A.
-        // Include safeBalanceB so the wrong-token swap below can convert it to A
-        // when the wallet holds no A (e.g. after a failed rebalance where only B was received).
+        // Below-range position needs only token A.
         amountA = safeBalanceA.toString();
-        amountB = safeBalanceB.toString();
+        amountB = '0';
       } else if (priceIsAboveRange) {
-        // Above-range position primarily needs token B.
-        // Include safeBalanceA so the wrong-token swap can convert it to B if needed.
-        amountA = safeBalanceA.toString();
+        // Above-range position needs only token B.
+        amountA = '0';
         amountB = safeBalanceB.toString();
       } else {
         // In-range position: provide both available token amounts.
@@ -1112,149 +854,6 @@ export class RebalanceService {
 
       if (BigInt(amountA) === 0n && BigInt(amountB) === 0n) {
         throw new Error('Insufficient token balance for this position range. Please add tokens to your wallet.');
-      }
-
-      // Zap-in: when the new position is in-range but we only have one token,
-      // swap the optimal amount of it so both tokens are available in the right
-      // ratio for the add-liquidity call.  This is the core "zap in" behaviour.
-      // When both tokens are present but their ratio doesn't match the position's
-      // requirements, also perform a corrective swap towards the required token.
-      if (!priceIsBelowRange && !priceIsAboveRange) {
-        const bigAmountA = BigInt(amountA);
-        const bigAmountB = BigInt(amountB);
-        const oneIsZero =
-          (bigAmountA > 0n && bigAmountB === 0n) ||
-          (bigAmountA === 0n && bigAmountB > 0n);
-
-        if (oneIsZero) {
-          // Only one token available — use an initial estimate of half; the
-          // optimal split is computed inside performZapInSwap using tick math.
-          const aToB = bigAmountA > 0n;
-          const swapAmount = (aToB ? bigAmountA : bigAmountB) / 2n;
-
-          if (swapAmount > 0n) {
-            const updated = await this.performZapInSwap(
-              poolInfo, aToB, swapAmount, bigAmountA, bigAmountB,
-              tickLower, tickUpper,
-            );
-            amountA = updated.amountA;
-            amountB = updated.amountB;
-          }
-        } else if (bigAmountA > 0n && bigAmountB > 0n) {
-          // Both tokens are available.  Check if their ratio matches the
-          // position's requirements using TickMath.  If one token is in excess
-          // (and the other is insufficient for the addLiquidity call), do a
-          // corrective swap towards the required token.
-          //
-          // IMPORTANT: the try/catch below wraps ONLY the ratio computation
-          // (getPool + TickMath arithmetic).  The performZapInSwap call is
-          // deliberately kept OUTSIDE the try/catch so that a swap-transaction
-          // failure (network error, on-chain abort, etc.) propagates up to
-          // retryAddLiquidity rather than being silently swallowed here.
-          // If the swap error were swallowed the code would proceed with the
-          // original imbalanced amounts and the subsequent add-liquidity call
-          // would fail too — this was the root cause of
-          // "Zap-in ratio check failed — proceeding with available amounts".
-          let correctiveSwap: { aToB: boolean; swapAmount: bigint } | null = null;
-
-          try {
-            const poolForRatio = await sdk.Pool.getPool(poolInfo.poolAddress);
-            const sqrtPriceCurrent = new BN(poolForRatio.current_sqrt_price);
-            const sqrtPriceLower = TickMath.tickIndexToSqrtPriceX64(tickLower);
-            const sqrtPriceUpper = TickMath.tickIndexToSqrtPriceX64(tickUpper);
-            const REF_LIQ = new BN('1' + '0'.repeat(18));
-            const refA = BigInt(getCoinAFromLiquidity(REF_LIQ, sqrtPriceCurrent, sqrtPriceUpper, false).toString());
-            const refB = BigInt(getCoinBFromLiquidity(REF_LIQ, sqrtPriceLower, sqrtPriceCurrent, false).toString());
-
-            if (refA > 0n && refB > 0n) {
-              // Determine which token is in excess relative to the required ratio.
-              // Excess A: bigAmountA / bigAmountB > refA / refB  →  bigAmountA * refB > refA * bigAmountB
-              // Excess B: bigAmountB / bigAmountA > refB / refA  →  bigAmountB * refA > refB * bigAmountA
-              const excessA = bigAmountA * refB > refA * bigAmountB;
-              const excessB = bigAmountB * refA > refB * bigAmountA;
-
-              if (excessA) {
-                // Too much A relative to B — swap some A → B.
-                // Optimal A to swap: (bigAmountA - bigAmountB * refA / refB) / 2  (approximate)
-                const idealA = bigAmountB * refA / refB;
-                const swapAmount = (bigAmountA - idealA) / 2n;
-                if (swapAmount > 0n) {
-                  correctiveSwap = { aToB: true, swapAmount };
-                }
-              } else if (excessB) {
-                // Too much B relative to A — swap some B → A.
-                const idealB = bigAmountA * refB / refA;
-                const swapAmount = (bigAmountB - idealB) / 2n;
-                if (swapAmount > 0n) {
-                  correctiveSwap = { aToB: false, swapAmount };
-                }
-              }
-              // else ratio is already correct — no swap needed
-            }
-          } catch (err) {
-            logger.warn('Zap-in ratio check failed — proceeding with available amounts', { error: err });
-          }
-
-          // Execute corrective swap.  Wrapped in try/catch so that if the swap
-          // fails (e.g. the SDK rejects it with "Insufficient balance" before the
-          // transaction is even submitted), execution falls through to
-          // retryAddLiquidity where the in-retry recovery swap will handle the
-          // imbalance instead of the error short-circuiting addLiquidity entirely.
-          if (correctiveSwap) {
-            const { aToB, swapAmount } = correctiveSwap;
-            const swapDir = aToB ? 'Zap-in: corrective swap A→B to fix token ratio'
-                                 : 'Zap-in: corrective swap B→A to fix token ratio';
-            logger.info(swapDir, {
-              amountA, amountB, swapAmount: swapAmount.toString(),
-            });
-            try {
-              const updated = await this.performZapInSwap(
-                poolInfo, aToB, swapAmount, bigAmountA, bigAmountB,
-                tickLower, tickUpper,
-              );
-              amountA = updated.amountA;
-              amountB = updated.amountB;
-            } catch (swapErr) {
-              // Corrective swap failed — proceed with pre-swap amounts.  The
-              // recovery swap inside retryAddLiquidity will handle the remaining
-              // token imbalance when createAddLiquidityFixTokenPayload fails.
-              logger.warn('Corrective zap-in swap failed — proceeding with pre-swap amounts; recovery swap will retry', { error: swapErr });
-            }
-          }
-        }
-      }
-
-      // Wrong-token swap for out-of-range positions.
-      // When close_position returns a single-sided token balance (e.g. only token B
-      // because the price rose above the old position's upper tick) but the new
-      // position happens to be on the opposite side of the current price, the
-      // bot must convert the received token to the one the new position requires.
-      //   - Below-range position needs only token A → swap all available token B → A
-      //   - Above-range position needs only token B → swap all available token A → B
-      // Wrapped in try/catch so a swap failure falls through to retryAddLiquidity's
-      // recovery swap rather than short-circuiting addLiquidity entirely.
-      if (priceIsBelowRange && BigInt(amountA) === 0n && BigInt(amountB) > 0n) {
-        const swapB = BigInt(amountB);
-        logger.info('Zap: position below range with only token B — swapping all B to A', { amountB });
-        // aToB=false (B→A), swapAmount=swapB, preSwapA=0 (none), preSwapB=swapB (all of B)
-        try {
-          const updated = await this.performZapInSwap(poolInfo, false, swapB, /* preSwapA */ 0n, /* preSwapB */ swapB);
-          amountA = updated.amountA;
-          amountB = updated.amountB;
-        } catch (swapErr) {
-          logger.warn('Wrong-token swap (B→A) failed — proceeding with pre-swap amounts; recovery swap will retry', { error: swapErr });
-        }
-      } else if (priceIsAboveRange && BigInt(amountB) === 0n && BigInt(amountA) > 0n) {
-        const swapA = BigInt(amountA);
-        logger.info('Zap: position above range with only token A — swapping all A to B', { amountA });
-        // aToB=true (A→B), swapAmount=swapA, preSwapA=swapA (all of A), preSwapB=0 (none)
-        try {
-          const updated = await this.performZapInSwap(poolInfo, true, swapA, /* preSwapA */ swapA, /* preSwapB */ 0n);
-          amountA = updated.amountA;
-          amountB = updated.amountB;
-        } catch (swapErr) {
-          logger.warn('Wrong-token swap (A→B) failed — proceeding with pre-swap amounts; recovery swap will retry', { error: swapErr });
-        }
       }
 
       const isOpen = !existingPositionId;
@@ -1282,9 +881,6 @@ export class RebalanceService {
         fix_amount_a: addLiquidityParams.fix_amount_a,
       });
 
-      // Flag to ensure the recovery swap is only attempted once across all retries.
-      let recoverySwapAttempted = false;
-
       const addResult = await this.retryAddLiquidity(
         async () => {
           // Refetch pool state on each retry for fresh sqrt price and tick index.
@@ -1294,9 +890,7 @@ export class RebalanceService {
 
           // Refetch wallet balances on each retry and cap amounts to the current
           // safe balance.  This prevents MoveAbort(repay_add_liquidity, 0) caused
-          // by amounts that exceed the actual wallet balance after gas-consuming
-          // transactions (initial zap swap, recovery swap, etc.) earlier in the
-          // rebalance flow.
+          // by amounts that exceed the actual wallet balance.
           const [retryBalA, retryBalB] = await Promise.all([
             suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
             suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
@@ -1318,118 +912,23 @@ export class RebalanceService {
             addLiquidityParams.amount_b,
           );
 
-          try {
-            const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
-              addLiquidityParams as any,
-              { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
-            );
-            payload.setGasBudget(this.config.gasBudget);
+          const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
+            addLiquidityParams as any,
+            { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
+          );
+          payload.setGasBudget(this.config.gasBudget);
 
-            const result = await suiClient.signAndExecuteTransaction({
-              transaction: payload,
-              signer: keypair,
-              options: { showEffects: true, showEvents: true },
-            });
+          const result = await suiClient.signAndExecuteTransaction({
+            transaction: payload,
+            signer: keypair,
+            options: { showEffects: true, showEvents: true },
+          });
 
-            if (result.effects?.status?.status !== 'success') {
-              throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
-            }
-
-            return result;
-          } catch (err) {
-            const errMsg = err instanceof Error ? err.message : String(err);
-            // Detect SDK "Insufficient balance for <coinType>, expect <amount>" error.
-            // This is thrown by the Cetus SDK client-side before the transaction is built
-            // when the wallet does not hold enough of a required token.  Perform a one-time
-            // recovery swap to obtain the missing token and update the amounts so the next
-            // retry attempt can succeed.
-            const insuffMatch = errMsg.match(/Insufficient balance for ([^\s,]+)\s*,\s*expect\s+(\d+)/i);
-            // MoveAbort code 0 from add_liquidity_fix_coin = delta_liquidity is zero.
-            // This is caused by severely imbalanced token amounts (the fixed token is too
-            // small to produce non-zero liquidity) after a failed corrective swap.
-            // The direction of the recovery swap is inferred from fix_amount_a:
-            //   fix_amount_a=false → B is fixed but too small → swap A→B (need more B)
-            //   fix_amount_a=true  → A is fixed but too small → swap B→A (need more A)
-            const isMoveAbortZeroFixCoin = errMsg.includes('add_liquidity_fix_coin') &&
-              /,\s*0\s*\)/.test(errMsg);
-            if ((insuffMatch || isMoveAbortZeroFixCoin) && !recoverySwapAttempted) {
-              recoverySwapAttempted = true;
-              const normalizedA = this.normalizeCoinType(poolInfo.coinTypeA);
-              const normalizedB = this.normalizeCoinType(poolInfo.coinTypeB);
-              // For "Insufficient balance" the needed coin type comes from the error message.
-              // For MoveAbort code 0 it is inferred from fix_amount_a (the fixed/deficit token).
-              const normalizedNeeded = insuffMatch
-                ? this.normalizeCoinType(insuffMatch[1])
-                : (addLiquidityParams.fix_amount_a ? normalizedA : normalizedB);
-
-              try {
-                if (insuffMatch) {
-                  logger.info('Insufficient balance detected — performing recovery swap before retry', {
-                    neededCoinType: insuffMatch[1],
-                    neededAmount: insuffMatch[2],
-                  });
-                } else {
-                  logger.info('MoveAbort code 0 (zero liquidity) — performing recovery swap to rebalance amounts', {
-                    fix_amount_a: addLiquidityParams.fix_amount_a,
-                    amountA: addLiquidityParams.amount_a,
-                    amountB: addLiquidityParams.amount_b,
-                  });
-                }
-
-                // Re-query wallet balances so the swap uses current on-chain state.
-                const [freshBalA, freshBalB] = await Promise.all([
-                  suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
-                  suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
-                ]);
-                const rawFreshA = BigInt(freshBalA.totalBalance);
-                const rawFreshB = BigInt(freshBalB.totalBalance);
-                const freshSafeBalA = isSuiA && rawFreshA > SUI_GAS_RESERVE ? rawFreshA - SUI_GAS_RESERVE : rawFreshA;
-                const freshSafeBalB = isSuiB && rawFreshB > SUI_GAS_RESERVE ? rawFreshB - SUI_GAS_RESERVE : rawFreshB;
-
-                // Use the full available balance as the initial swap estimate so that
-                // the preswap exchange rate is computed for the actual swap size.
-                // computeOptimalZapSwapAmount will refine this to the correct fraction
-                // of the total that achieves the required A:B ratio.  Using the full
-                // balance (instead of half) gives a more accurate exchange-rate baseline
-                // and ensures the recovery swap provides enough of the required token.
-                let updated: { amountA: string; amountB: string } | null = null;
-                if (normalizedNeeded === normalizedA && freshSafeBalB > 0n) {
-                  // Need tokenA — swap tokenB → tokenA
-                  updated = await this.performZapInSwap(
-                    poolInfo, false, freshSafeBalB,
-                    freshSafeBalA, freshSafeBalB,
-                    tickLower, tickUpper,
-                  );
-                } else if (normalizedNeeded === normalizedB && freshSafeBalA > 0n) {
-                  // Need tokenB — swap tokenA → tokenB
-                  updated = await this.performZapInSwap(
-                    poolInfo, true, freshSafeBalA,
-                    freshSafeBalA, freshSafeBalB,
-                    tickLower, tickUpper,
-                  );
-                } else {
-                  logger.warn('Recovery swap skipped: no source token available', {
-                    normalizedNeeded, freshSafeBalA: freshSafeBalA.toString(), freshSafeBalB: freshSafeBalB.toString(),
-                  });
-                }
-
-                if (updated) {
-                  addLiquidityParams.amount_a = updated.amountA;
-                  addLiquidityParams.amount_b = updated.amountB;
-                  amountA = updated.amountA;
-                  amountB = updated.amountB;
-
-                  logger.info('Recovery swap completed — retrying add liquidity with updated amounts', {
-                    amountA: addLiquidityParams.amount_a,
-                    amountB: addLiquidityParams.amount_b,
-                  });
-                }
-              } catch (swapErr) {
-                logger.warn('Recovery swap failed — proceeding with original amounts', { error: swapErr });
-              }
-            }
-            throw err;
+          if (result.effects?.status?.status !== 'success') {
+            throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
           }
+
+          return result;
         },
         3,
         3000,
