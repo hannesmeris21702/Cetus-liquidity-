@@ -53,7 +53,11 @@ async function retryAddLiquidity<T>(
 
       // MoveAbort errors are contract-level failures that cannot be resolved
       // by retrying with the same parameters — throw immediately.
-      if (errorMsg.includes('MoveAbort')) {
+      // Exception: add_liquidity_fix_coin aborting with code 0 (delta_liquidity == 0)
+      // may be caused by severely imbalanced token amounts after a failed corrective
+      // swap; the recovery-swap inside the operation will rebalance them on the next retry.
+      if (errorMsg.includes('MoveAbort') &&
+          !(errorMsg.includes('add_liquidity_fix_coin') && /,\s*0\s*\)/.test(errorMsg))) {
         mockLogger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
         throw error;
       }
@@ -239,6 +243,38 @@ async function runTests() {
     }
 
     console.log('✔ MoveAbort errors are thrown immediately without retrying');
+  }
+
+  // Test 7: add_liquidity_fix_coin code 0 (zero liquidity) is retryable — not thrown immediately
+  {
+    mockLogger.clearLogs();
+    let callCount = 0;
+    const zeroLiquidityError = new Error(
+      'Failed to add liquidity: MoveAbort(MoveLocation { module: ModuleId { address: 75b2e9ecad34944b8d0c874e568c90db0cf9437f0d7392abfd4cb902972f3e40, name: Identifier("pool") }, function: 6, instruction: 14, function_name: Some("add_liquidity_fix_coin") }, 0) in command 2'
+    );
+
+    try {
+      await retryAddLiquidity(async () => {
+        callCount++;
+        throw zeroLiquidityError;
+      }, 3, 10);
+      assert.fail('Should have thrown error after max retries');
+    } catch (error) {
+      assert.strictEqual(error, zeroLiquidityError, 'Should re-throw the original error after retries');
+      assert.strictEqual(callCount, 3, 'Should retry all 3 attempts (not throw immediately)');
+
+      const abortLog = mockLogger.logs.find(
+        (log) => log.level === 'error' && log.message.includes('Non-retryable MoveAbort error')
+      );
+      assert.ok(!abortLog, 'Should NOT log non-retryable MoveAbort for add_liquidity_fix_coin code 0');
+
+      const retryLog = mockLogger.logs.find(
+        (log) => log.level === 'warn' && log.message.includes('failed, retrying')
+      );
+      assert.ok(retryLog, 'Should log retry warning for add_liquidity_fix_coin code 0');
+    }
+
+    console.log('✔ add_liquidity_fix_coin code 0 (zero liquidity) is retried, not thrown immediately');
   }
 
   console.log('\nAll add liquidity retry tests passed ✅');
