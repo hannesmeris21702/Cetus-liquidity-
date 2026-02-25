@@ -649,44 +649,6 @@ export class RebalanceService {
   }
 
   /**
-   * Determine which token amount to fix when calling createAddLiquidityFixTokenPayload.
-   *
-   * The Cetus CLMM Move contract's get_liquidity_by_amount aborts with error 3018 when:
-   *   - fix_amount_a=true  and current price >= upper tick (price at/above range)
-   *   - fix_amount_a=false and current price <  lower tick (price below range)
-   * Therefore for out-of-range positions the direction MUST be set by the price range,
-   * not by the token amounts.
-   *
-   * @param currentTickIndex - current pool tick index
-   * @param tickLower - position lower tick
-   * @param tickUpper - position upper tick
-   * @param amountA - available token A amount (as string)
-   * @param amountB - available token B amount (as string)
-   * @returns true to fix token A, false to fix token B
-   */
-  private determineFixAmountA(
-    currentTickIndex: number,
-    tickLower: number,
-    tickUpper: number,
-    amountA: string,
-    amountB: string,
-  ): boolean {
-    if (currentTickIndex < tickLower) {
-      // Price below range: only token A is needed; fixing token B would cause error 3018
-      return true;
-    }
-    if (currentTickIndex >= tickUpper) {
-      // Price at/above range: only token B is needed; fixing token A would cause error 3018
-      return false;
-    }
-    // Price is in range: fix the SMALLER token amount so the SDK calculates
-    // the required counterpart from it — the calculated counterpart equals
-    // (smallerAmount × poolRatio) and is therefore ≤ the larger available
-    // balance, preventing "Insufficient balance" errors.
-    return BigInt(amountA) <= BigInt(amountB);
-  }
-
-  /**
    * Calculate the amount to use for a single token in the zap call when
    * rebalancing from a closed position.
    *
@@ -707,17 +669,19 @@ export class RebalanceService {
   /**
    * Add liquidity using the SDK's fix-token (zap) method.
    *
-   * When closedPositionAmounts are provided (rebalancing case) the method uses
-   * those freed token amounts as the zap inputs instead of the full wallet
-   * balance.  This ensures the new position is funded exclusively by the
-   * liquidity that was released from the closed out-of-range position:
+   * The Cetus SDK zap-in requires only a single token as input.  When
+   * `fix_amount_a=true` the SDK treats `amount_a` as the full input and
+   * internally swaps the right portion to obtain the counterpart token before
+   * adding liquidity.  When `fix_amount_a=false` `amount_b` is the full input.
    *
-   *  - Freed amount > 0 and ≤ safe wallet balance → use the freed amount
-   *  - Freed amount > safe wallet balance          → cap to safe wallet balance
-   *  - Both freed amounts are 0                   → fall back to full wallet balance
+   * When closedPositionAmounts are provided (rebalancing case) the freed token
+   * that matches the new price range is used as the single input:
+   *  - below-range / in-range with freed A → use freed A (capped to wallet)
+   *  - above-range / in-range with only freed B → use freed B (capped to wallet)
+   *  - both freed amounts are 0 → fall back to the matching wallet balance
    *
    * When no closedPositionAmounts are given (new position from scratch) the
-   * wallet-balance logic applies for all range configurations.
+   * matching wallet-balance token is used.
    */
   private async addLiquidity(
     poolInfo: PoolInfo,
@@ -791,7 +755,9 @@ export class RebalanceService {
         priceIsAboveRange,
       });
 
-      // Select token amounts for the zap call.
+      // The Cetus SDK zap-in takes a single token as input and handles the
+      // internal swap to obtain the correct A:B ratio automatically.
+      // Always pass exactly one non-zero token; set the other to '0'.
       let amountA: string;
       let amountB: string;
 
@@ -816,40 +782,51 @@ export class RebalanceService {
         const removedA = BigInt(closedPositionAmounts.amountA);
         const removedB = BigInt(closedPositionAmounts.amountB);
         if (removedA > 0n || removedB > 0n) {
-          // Rebalancing: use only the tokens freed from the closed position.
-          // Cap each amount at the safe wallet balance in case gas consumed some SUI.
-          amountA = this.calculateZapAmount(removedA, safeBalanceA);
-          amountB = this.calculateZapAmount(removedB, safeBalanceB);
-          logger.info('Using closed position token amounts for zap', {
+          // Pick the single token the new position range requires.
+          // Below-range or in-range: prefer A. Above-range or no freed A: use B.
+          if (!priceIsAboveRange && removedA > 0n) {
+            amountA = this.calculateZapAmount(removedA, safeBalanceA);
+            amountB = '0';
+          } else {
+            amountA = '0';
+            amountB = removedB > 0n
+              ? this.calculateZapAmount(removedB, safeBalanceB)
+              : safeBalanceB.toString();
+          }
+          logger.info('Using freed position tokens for single-sided zap', {
             removedA: closedPositionAmounts.amountA,
             removedB: closedPositionAmounts.amountB,
             amountA,
             amountB,
           });
         } else {
-          // Balance change parsing returned 0 for both tokens (e.g. net SUI change
-          // was negative due to gas cost exceeding the SUI held in the position).
-          // Fall back to wallet balance so the freed tokens can still be used.
-          logger.warn('Closed position amounts are both 0 — falling back to wallet balance for zap', {
-            safeBalanceA: safeBalanceA.toString(),
-            safeBalanceB: safeBalanceB.toString(),
-          });
-          amountA = safeBalanceA.toString();
-          amountB = safeBalanceB.toString();
+          // Balance change parsing returned 0 for both tokens — fall back to wallet balance.
+          logger.warn('Closed position amounts are both 0 — falling back to wallet balance for zap');
+          if (!priceIsAboveRange && safeBalanceA > 0n) {
+            amountA = safeBalanceA.toString();
+            amountB = '0';
+          } else {
+            amountA = '0';
+            amountB = safeBalanceB.toString();
+          }
         }
       } else if (priceIsBelowRange) {
-        // Below-range position needs only token A.
+        // Below-range position: only token A is needed.
         amountA = safeBalanceA.toString();
         amountB = '0';
       } else if (priceIsAboveRange) {
-        // Above-range position needs only token B.
+        // Above-range position: only token B is needed.
         amountA = '0';
         amountB = safeBalanceB.toString();
       } else {
-        // In-range position: provide both available token amounts.
-        // The SDK uses fix_amount_a to calculate the correct counterpart amount.
-        amountA = safeBalanceA.toString();
-        amountB = safeBalanceB.toString();
+        // In-range position: prefer A; fall back to B if no A available.
+        if (safeBalanceA > 0n) {
+          amountA = safeBalanceA.toString();
+          amountB = '0';
+        } else {
+          amountA = '0';
+          amountB = safeBalanceB.toString();
+        }
       }
 
       if (BigInt(amountA) === 0n && BigInt(amountB) === 0n) {
@@ -867,7 +844,7 @@ export class RebalanceService {
         amount_a: amountA,
         amount_b: amountB,
         slippage: this.config.maxSlippage,
-        fix_amount_a: this.determineFixAmountA(currentTickIndex, tickLower, tickUpper, amountA, amountB),
+        fix_amount_a: BigInt(amountA) > 0n,
         is_open: isOpen,
         coinTypeA: poolInfo.coinTypeA,
         coinTypeB: poolInfo.coinTypeB,
@@ -883,14 +860,13 @@ export class RebalanceService {
 
       const addResult = await this.retryAddLiquidity(
         async () => {
-          // Refetch pool state on each retry for fresh sqrt price and tick index.
-          // Re-evaluating fix_amount_a prevents error 3018 when price moves between retries.
+          // Refetch pool state on each retry for a fresh sqrt price.
           const freshPool = await sdk.Pool.getPool(poolInfo.poolAddress);
           const freshSqrtPrice = new BN(freshPool.current_sqrt_price);
 
-          // Refetch wallet balances on each retry and cap amounts to the current
-          // safe balance.  This prevents MoveAbort(repay_add_liquidity, 0) caused
-          // by amounts that exceed the actual wallet balance.
+          // Refetch wallet balances on each retry and cap the zap amount to the
+          // current safe balance.  This prevents MoveAbort(repay_add_liquidity, 0)
+          // when gas has reduced the balance since the initial amount was chosen.
           const [retryBalA, retryBalB] = await Promise.all([
             suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
             suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
@@ -904,13 +880,8 @@ export class RebalanceService {
           if (capA > safeRetryA) addLiquidityParams.amount_a = safeRetryA.toString();
           if (capB > safeRetryB) addLiquidityParams.amount_b = safeRetryB.toString();
 
-          addLiquidityParams.fix_amount_a = this.determineFixAmountA(
-            freshPool.current_tick_index,
-            tickLower,
-            tickUpper,
-            addLiquidityParams.amount_a,
-            addLiquidityParams.amount_b,
-          );
+          // fix_amount_a follows the non-zero token; it does not change between retries
+          // because we committed to a single input token when amounts were selected above.
 
           const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
             addLiquidityParams as any,
