@@ -1282,6 +1282,25 @@ export class RebalanceService {
           // Re-evaluating fix_amount_a prevents error 3018 when price moves between retries.
           const freshPool = await sdk.Pool.getPool(poolInfo.poolAddress);
           const freshSqrtPrice = new BN(freshPool.current_sqrt_price);
+
+          // Refetch wallet balances on each retry and cap amounts to the current
+          // safe balance.  This prevents MoveAbort(repay_add_liquidity, 0) caused
+          // by amounts that exceed the actual wallet balance after gas-consuming
+          // transactions (initial zap swap, recovery swap, etc.) earlier in the
+          // rebalance flow.
+          const [retryBalA, retryBalB] = await Promise.all([
+            suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
+            suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
+          ]);
+          const rawRetryA = BigInt(retryBalA.totalBalance);
+          const rawRetryB = BigInt(retryBalB.totalBalance);
+          const safeRetryA = isSuiA && rawRetryA > SUI_GAS_RESERVE ? rawRetryA - SUI_GAS_RESERVE : rawRetryA;
+          const safeRetryB = isSuiB && rawRetryB > SUI_GAS_RESERVE ? rawRetryB - SUI_GAS_RESERVE : rawRetryB;
+          const capA = BigInt(addLiquidityParams.amount_a);
+          const capB = BigInt(addLiquidityParams.amount_b);
+          if (capA > safeRetryA) addLiquidityParams.amount_a = safeRetryA.toString();
+          if (capB > safeRetryB) addLiquidityParams.amount_b = safeRetryB.toString();
+
           addLiquidityParams.fix_amount_a = this.determineFixAmountA(
             freshPool.current_tick_index,
             tickLower,
