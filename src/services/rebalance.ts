@@ -3,6 +3,7 @@ import { PositionMonitorService, PoolInfo, PositionInfo } from './monitor';
 import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
+import { TickMath, estimateLiquidityForCoinA, estimateLiquidityForCoinB } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import type { BalanceChange } from '@mysten/sui/client';
 
 export interface RebalanceResult {
@@ -625,29 +626,78 @@ export class RebalanceService {
         );
       }
 
+      const curSqrtPrice = new BN(pool.current_sqrt_price);
+      const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
+      const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
+
       logger.info('Current tick is within configured range', {
         currentTickIndex,
         tickLower,
         tickUpper,
       });
 
-      // Determine single-sided zap input from env vars only.
-      // TOKEN_A_AMOUNT takes priority when both are set.
+      // Determine single-sided zap input from env vars only, but ensure the
+      // chosen side can actually mint non-zero liquidity at the current price.
       const envAmountA = this.config.tokenAAmount;
       const envAmountB = this.config.tokenBAmount;
+      const zero = new BN(0);
+
+      type QuoteSide = { token: 'A' | 'B'; amount: string; liquidity: BN };
+      const quotes: QuoteSide[] = [];
+
+      if (envAmountA) {
+        const liqA = estimateLiquidityForCoinA(curSqrtPrice, sqrtUpperPrice, new BN(envAmountA));
+        quotes.push({ token: 'A', amount: envAmountA, liquidity: liqA });
+      }
+      if (envAmountB) {
+        const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, curSqrtPrice, new BN(envAmountB));
+        quotes.push({ token: 'B', amount: envAmountB, liquidity: liqB });
+      }
+
+      if (quotes.length === 0) {
+        throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
+      }
+
+      const viable = quotes.filter(q => q.liquidity.gt(zero));
+
+      if (viable.length === 0) {
+        logger.error('SDK zap-in quote predicts zero liquidity for configured token side', {
+          currentTickIndex,
+          tickLower,
+          tickUpper,
+          quotes: quotes.map(q => ({
+            token: q.token,
+            amount: q.amount,
+            predictedLiquidity: q.liquidity.toString(),
+          })),
+        });
+        throw new Error('Zap-in quote returned zero liquidity for configured token side');
+      }
+
+      const chosen = viable[0];
       let amountA: string;
       let amountB: string;
 
-      if (envAmountA) {
-        amountA = envAmountA;
+      if (chosen.token === 'A') {
+        amountA = chosen.amount;
         amountB = '0';
-        logger.info('Using TOKEN_A_AMOUNT for zap-in', { amountA });
-      } else if (envAmountB) {
-        amountA = '0';
-        amountB = envAmountB;
-        logger.info('Using TOKEN_B_AMOUNT for zap-in', { amountB });
+        if (quotes.some(q => q.token === 'B' && q.liquidity.eq(zero))) {
+          logger.warn('TOKEN_B_AMOUNT cannot mint liquidity at current tick — using TOKEN_A_AMOUNT instead');
+        }
+        logger.info('Using TOKEN_A_AMOUNT for zap-in', {
+          amountA,
+          predictedLiquidity: chosen.liquidity.toString(),
+        });
       } else {
-        throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
+        amountA = '0';
+        amountB = chosen.amount;
+        if (quotes.some(q => q.token === 'A' && q.liquidity.eq(zero))) {
+          logger.warn('TOKEN_A_AMOUNT cannot mint liquidity at current tick — using TOKEN_B_AMOUNT instead');
+        }
+        logger.info('Using TOKEN_B_AMOUNT for zap-in', {
+          amountB,
+          predictedLiquidity: chosen.liquidity.toString(),
+        });
       }
 
       const isOpen = !existingPositionId;
@@ -675,7 +725,7 @@ export class RebalanceService {
         fix_amount_a: addLiquidityParams.fix_amount_a,
       });
 
-      const freshSqrtPrice = new BN(pool.current_sqrt_price);
+      const freshSqrtPrice = curSqrtPrice;
       const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
         addLiquidityParams as any,
         { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
