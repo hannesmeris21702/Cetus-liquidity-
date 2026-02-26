@@ -63,7 +63,7 @@ function validateTickInRange(currentTick: number, tickLower: number, tickUpper: 
  * Chooses whichever env token can mint non-zero liquidity at the current tick.
  * Throws when the configured token(s) would mint zero liquidity.
  */
-function selectEnvZapWithQuote(opts: {
+function selectEnvZapWithValidation(opts: {
   envAmountA?: string;
   envAmountB?: string;
   tickLower: number;
@@ -251,7 +251,7 @@ console.log('Running env-based zap-in tests...\n');
 {
   let thrown = false;
   try {
-    selectEnvZapWithQuote({
+    selectEnvZapWithValidation({
       envAmountB: '5000000',
       tickLower: 100,
       tickUpper: 200,
@@ -270,7 +270,7 @@ console.log('Running env-based zap-in tests...\n');
 
 // 13. Price at lower tick with both env tokens → selects TOKEN_A automatically
 {
-  const { amountA, amountB } = selectEnvZapWithQuote({
+  const { amountA, amountB } = selectEnvZapWithValidation({
     envAmountA: '7000000',
     envAmountB: '5000000',
     tickLower: 100,

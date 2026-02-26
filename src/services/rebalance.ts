@@ -49,6 +49,8 @@ interface AddLiquidityFixTokenParams {
   rewarder_coin_types: string[];
 }
 
+type QuoteSide = { token: 'A' | 'B'; amount: string; liquidity: BN };
+
 export class RebalanceService {
   private sdkService: CetusSDKService;
   private monitorService: PositionMonitorService;
@@ -641,8 +643,6 @@ export class RebalanceService {
       const envAmountA = this.config.tokenAAmount;
       const envAmountB = this.config.tokenBAmount;
       const zero = new BN(0);
-
-      type QuoteSide = { token: 'A' | 'B'; amount: string; liquidity: BN };
       const quotes: QuoteSide[] = [];
 
       if (envAmountA) {
@@ -661,7 +661,7 @@ export class RebalanceService {
       const viable = quotes.filter(q => q.liquidity.gt(zero));
 
       if (viable.length === 0) {
-        logger.error('SDK zap-in quote predicts zero liquidity for configured token side', {
+        logger.error('SDK zap-in quote predicts zero liquidity for configured token side(s)', {
           currentTickIndex,
           tickLower,
           tickUpper,
@@ -671,7 +671,7 @@ export class RebalanceService {
             predictedLiquidity: q.liquidity.toString(),
           })),
         });
-        throw new Error('Zap-in quote returned zero liquidity for configured token side');
+        throw new Error('Zap-in quote returned zero liquidity for configured token side(s)');
       }
 
       const chosen = viable[0];
