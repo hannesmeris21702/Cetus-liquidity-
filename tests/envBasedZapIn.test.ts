@@ -80,20 +80,20 @@ function selectEnvZapWithValidation(opts: {
   const curSqrt = TickMath.tickIndexToSqrtPriceX64(currentTick);
   const zero = new BN(0);
 
-  const quotes: Array<{ token: 'A' | 'B'; amount: string; liq: BN }> = [];
+  const quotes: Array<{ token: 'A' | 'B'; amount: string; liquidity: BN }> = [];
 
   if (envAmountA) {
     quotes.push({
       token: 'A',
       amount: envAmountA,
-      liq: estimateLiquidityForCoinA(curSqrt, sqrtUpper, new BN(envAmountA)),
+      liquidity: estimateLiquidityForCoinA(curSqrt, sqrtUpper, new BN(envAmountA)),
     });
   }
   if (envAmountB) {
     quotes.push({
       token: 'B',
       amount: envAmountB,
-      liq: estimateLiquidityForCoinB(sqrtLower, curSqrt, new BN(envAmountB)),
+      liquidity: estimateLiquidityForCoinB(sqrtLower, curSqrt, new BN(envAmountB)),
     });
   }
 
@@ -101,7 +101,7 @@ function selectEnvZapWithValidation(opts: {
     throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
   }
 
-  const viable = quotes.filter(q => q.liq.gt(zero));
+  const viable = quotes.filter(q => q.liquidity.gt(zero));
   if (viable.length === 0) {
     throw new Error('Zap-in quote returned zero liquidity for configured token side');
   }

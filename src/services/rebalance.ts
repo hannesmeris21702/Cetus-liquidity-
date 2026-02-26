@@ -676,7 +676,6 @@ export class RebalanceService {
 
       // Preserve precedence: TOKEN_A remains first when both sides are viable.
       const chosen = viable[0];
-      const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
       const otherTokenIfZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
       let amountA: string;
       let amountB: string;
@@ -699,6 +698,7 @@ export class RebalanceService {
 
       if (otherTokenIfZero) {
         const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
+        const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         logger.warn(`${skippedLabel} cannot mint liquidity at current tick — using ${chosenLabel} instead`);
       }
 
