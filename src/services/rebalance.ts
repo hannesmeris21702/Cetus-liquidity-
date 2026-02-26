@@ -886,8 +886,16 @@ export class RebalanceService {
           if (capA > safeRetryA) addLiquidityParams.amount_a = safeRetryA.toString();
           if (capB > safeRetryB) addLiquidityParams.amount_b = safeRetryB.toString();
 
-          // fix_amount_a follows the non-zero token; it does not change between retries
-          // because we committed to a single input token when amounts were selected above.
+          // After capping, update fix_amount_a to reflect the non-zero input token.
+          // If the primary token's balance dropped to zero (e.g. SUI consumed by gas),
+          // passing (amount=0, fix_amount_a=true) to the SDK always computes zero
+          // liquidity and triggers MoveAbort(repay_add_liquidity, 0).
+          const retryAmtA = BigInt(addLiquidityParams.amount_a);
+          const retryAmtB = BigInt(addLiquidityParams.amount_b);
+          if (retryAmtA === 0n && retryAmtB === 0n) {
+            throw new Error('Insufficient token balance for add liquidity retry: both amounts are zero after capping to current safe balance.');
+          }
+          addLiquidityParams.fix_amount_a = retryAmtA > 0n;
 
           const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
             addLiquidityParams as any,
