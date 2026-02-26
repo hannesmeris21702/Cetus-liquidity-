@@ -50,6 +50,7 @@ interface AddLiquidityFixTokenParams {
 }
 
 type QuoteSide = { token: 'A' | 'B'; amount: string; liquidity: BN };
+const labelForToken = (token: 'A' | 'B') => token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
 
 export class RebalanceService {
   private sdkService: CetusSDKService;
@@ -697,13 +698,12 @@ export class RebalanceService {
         });
       }
 
-      const labelForToken = (token: 'A' | 'B') => token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
       if (quotes.length > 1) {
         const otherToken = quotes.find(q => q.token !== chosen.token);
         // Only warn when the non-selected configured token would mint zero liquidity.
         if (otherToken && otherToken.liquidity.eq(zero)) {
           logger.warn(
-            `${labelForToken(otherToken.token)} cannot mint liquidity at current tick — using ${labelForToken(chosen.token)} instead`,
+            `${labelForToken(otherToken.token)} cannot mint liquidity at current tick - using ${labelForToken(chosen.token)} instead`,
           );
         }
       }
