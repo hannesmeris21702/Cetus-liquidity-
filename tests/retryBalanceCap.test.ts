@@ -28,10 +28,11 @@ function safeBalance(rawBalance: bigint, isSui: boolean): bigint {
 /**
  * Simulates the per-retry operation closure from addLiquidity that:
  *   1. Refetches wallet balances and caps amounts.
- *   2. Updates fix_amount_a to match the non-zero input after capping.
- *   3. Throws early if both amounts are zero after capping.
- *   4. Calls createAddLiquidityFixTokenPayload (mocked).
- *   5. Executes the transaction.
+ *   2. Detects price-crossed-boundary and switches the input token if needed.
+ *   3. Updates fix_amount_a to match the non-zero input after adjustments.
+ *   4. Throws early if both amounts are zero after adjustments.
+ *   5. Calls createAddLiquidityFixTokenPayload (mocked).
+ *   6. Executes the transaction.
  */
 async function simulateRetryOperation(opts: {
   amountA: bigint;
@@ -39,6 +40,11 @@ async function simulateRetryOperation(opts: {
   fixAmountA: boolean;
   isSuiA: boolean;
   isSuiB: boolean;
+  /** tick range for the position */
+  tickLower?: number;
+  tickUpper?: number;
+  /** fresh pool tick index returned on each retry attempt */
+  freshTickIndexes?: number[];
   /** wallet balance returned by getBalance on each retry attempt */
   walletBalances: Array<{ rawA: bigint; rawB: bigint }>;
   /** If true, the SDK throws on this attempt (0-indexed); else succeeds */
@@ -56,6 +62,9 @@ async function simulateRetryOperation(opts: {
     walletBalances,
     sdkThrowsOnAttempt = new Set(),
     maxRetries = 3,
+    tickLower = -100,
+    tickUpper = 100,
+    freshTickIndexes,
   } = opts;
 
   // Mutable params (mirrors addLiquidityParams in production code)
@@ -77,10 +86,41 @@ async function simulateRetryOperation(opts: {
       if (paramAmountA > safeA) paramAmountA = safeA;
       if (paramAmountB > safeB) paramAmountB = safeB;
 
-      // After capping, update fix_amount_a to reflect the non-zero input token.
-      // If the primary token's balance dropped to zero (e.g. SUI consumed by gas),
-      // passing (amount=0, fix_amount_a=true) to the SDK always computes zero
-      // liquidity and triggers MoveAbort(repay_add_liquidity, 0).
+      // ── Price-crossed-boundary token switch ───────────────────────────────
+      // Mirrors the new logic added to rebalance.ts to handle MoveAbort(repay_add_liquidity, 0)
+      // caused by using the wrong token when the price has moved across the range boundary.
+      if (freshTickIndexes) {
+        const freshTickIdx = Math.min(attempt - 1, freshTickIndexes.length - 1);
+        const freshTickIndex = freshTickIndexes[freshTickIdx];
+        const freshPriceIsAboveRange = freshTickIndex >= tickUpper;
+        const freshPriceIsBelowRange = freshTickIndex < tickLower;
+
+        if (freshPriceIsAboveRange && paramFixAmountA) {
+          if (safeB > 0n) {
+            paramAmountA = 0n;
+            paramAmountB = safeB;
+          } else {
+            throw new Error(
+              `Cannot add liquidity: price (tick ${freshTickIndex}) is above range upper tick ${tickUpper} ` +
+              'but token B balance is zero. Please add token B to your wallet.',
+            );
+          }
+        } else if (freshPriceIsBelowRange && !paramFixAmountA) {
+          if (safeA > 0n) {
+            paramAmountA = safeA;
+            paramAmountB = 0n;
+          } else {
+            throw new Error(
+              `Cannot add liquidity: price (tick ${freshTickIndex}) is below range lower tick ${tickLower} ` +
+              'but token A balance is zero. Please add token A to your wallet.',
+            );
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
+      // After capping and price-based token switching, update fix_amount_a to
+      // reflect the non-zero input token.
       const retryAmtA = paramAmountA;
       const retryAmtB = paramAmountB;
       if (retryAmtA === 0n && retryAmtB === 0n) {
@@ -105,7 +145,7 @@ async function simulateRetryOperation(opts: {
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       // (MoveAbort non-retryable logic intentionally omitted for this test —
-      //  the point is that with correct capping MoveAbort(0) never fires.)
+      //  the point is that with correct token selection MoveAbort(0) never fires.)
     }
   }
 
@@ -290,6 +330,149 @@ async function runTests() {
     assert.strictEqual(result.attemptAmounts[0].amountB, 450n, 'amountB capped to 450');
     assert.strictEqual(result.attemptAmounts[0].fixAmountA, false, 'fixAmountA stays false when only amountB > 0');
     console.log('✔ fix_amount_a stays false when tokenB is the sole non-zero input');
+  }
+
+  // ── Test 8: price moved ABOVE range while using token A → switch to token B ─
+  //           Root cause of the new MoveAbort(repay_add_liquidity, 0) error
+  {
+    // Scenario: initial amounts set with fix_amount_a=true (using A, price was in/below range)
+    // but by the time the first attempt executes, the price crossed above the upper tick.
+    // Without the fix: fix_amount_a=true + price above range → delta_liquidity_from_a = 0
+    //                  → MoveAbort(repay_add_liquidity, 0) on all retries.
+    // With the fix: retry detects price > upper tick and switches to token B → success.
+
+    const result = await simulateRetryOperation({
+      amountA: 1_000_000n,
+      amountB: 0n,
+      fixAmountA: true,
+      isSuiA: false,
+      isSuiB: false,
+      tickLower: -100,
+      tickUpper: 100,
+      // Attempt 1: price above range → switch to B (succeeds)
+      freshTickIndexes: [150],  // > tickUpper=100
+      walletBalances: [{ rawA: 1_000_000n, rawB: 500_000n }],
+      sdkThrowsOnAttempt: new Set(),  // SDK succeeds after token switch
+    });
+
+    assert.ok(result.succeeded, 'Should succeed after switching to token B');
+    assert.strictEqual(result.attempts, 1, 'Should succeed on first attempt after token switch');
+    assert.strictEqual(result.attemptAmounts[0].amountA, 0n, 'amountA should be 0 after switch');
+    assert.strictEqual(result.attemptAmounts[0].amountB, 500_000n, 'amountB should be safeRetryB after switch');
+    assert.strictEqual(result.attemptAmounts[0].fixAmountA, false, 'fixAmountA should be false after switch to B');
+    console.log('✔ Price above range: switches from token A to token B, preventing MoveAbort(repay_add_liquidity, 0)');
+  }
+
+  // ── Test 9: price moved BELOW range while using token B → switch to token A ─
+  {
+    // Scenario: initial amounts set with fix_amount_a=false (using B, price was in/above range)
+    // but by the time the attempt executes, the price crossed below the lower tick.
+    // Without the fix: fix_amount_a=false + price below range → delta_liquidity_from_b = 0
+    //                  → MoveAbort(repay_add_liquidity, 0).
+    // With the fix: retry detects price < lower tick and switches to token A → success.
+
+    const result = await simulateRetryOperation({
+      amountA: 0n,
+      amountB: 800_000n,
+      fixAmountA: false,
+      isSuiA: false,
+      isSuiB: false,
+      tickLower: -100,
+      tickUpper: 100,
+      // Price below range → switch to A
+      freshTickIndexes: [-200],  // < tickLower=-100
+      walletBalances: [{ rawA: 600_000n, rawB: 800_000n }],
+    });
+
+    assert.ok(result.succeeded, 'Should succeed after switching to token A');
+    assert.strictEqual(result.attemptAmounts[0].amountA, 600_000n, 'amountA should be safeRetryA after switch');
+    assert.strictEqual(result.attemptAmounts[0].amountB, 0n, 'amountB should be 0 after switch');
+    assert.strictEqual(result.attemptAmounts[0].fixAmountA, true, 'fixAmountA should be true after switch to A');
+    console.log('✔ Price below range: switches from token B to token A, preventing MoveAbort(repay_add_liquidity, 0)');
+  }
+
+  // ── Test 10: price above range, no token B available → fail fast with clear error
+  {
+    // Scenario: price crossed above range, using A, but no B in wallet.
+    // The retry cannot recover — throw a clear error instead of submitting doomed txs.
+
+    const result = await simulateRetryOperation({
+      amountA: 1_000_000n,
+      amountB: 0n,
+      fixAmountA: true,
+      isSuiA: false,
+      isSuiB: false,
+      tickLower: -100,
+      tickUpper: 100,
+      freshTickIndexes: [150],  // above range
+      walletBalances: [{ rawA: 1_000_000n, rawB: 0n }],  // no token B
+      maxRetries: 3,
+    });
+
+    assert.ok(!result.succeeded, 'Should fail when price above range and no token B available');
+    assert.ok(
+      result.lastError?.message.includes('token B balance is zero'),
+      `Should throw informative error about missing token B; got: ${result.lastError?.message}`,
+    );
+    console.log('✔ Price above range with no token B: fails fast with informative error message');
+  }
+
+  // ── Test 11: price in range, fix_amount_a=true → no token switch needed ─────
+  {
+    // Scenario: price is in range, using A. No switch should occur.
+
+    const result = await simulateRetryOperation({
+      amountA: 1_000_000n,
+      amountB: 0n,
+      fixAmountA: true,
+      isSuiA: false,
+      isSuiB: false,
+      tickLower: -100,
+      tickUpper: 100,
+      freshTickIndexes: [0],  // in range
+      walletBalances: [{ rawA: 1_000_000n, rawB: 500_000n }],
+    });
+
+    assert.ok(result.succeeded, 'Should succeed when price is in range');
+    assert.strictEqual(result.attemptAmounts[0].amountA, 1_000_000n, 'amountA unchanged when in range');
+    assert.strictEqual(result.attemptAmounts[0].fixAmountA, true, 'fixAmountA unchanged when in range');
+    console.log('✔ Price in range: no token switch — uses original fix_amount_a=true');
+  }
+
+  // ── Test 12: price crosses boundary on attempt 2, switches on retry → success
+  {
+    // Scenario: attempt 1 uses original token A (in range initially) and
+    // fails with MoveAbort(0) because on-chain price was above range at execution.
+    // Attempt 2 detects price > upper tick and switches to B → succeeds.
+
+    const result = await simulateRetryOperation({
+      amountA: 1_000_000n,
+      amountB: 0n,
+      fixAmountA: true,
+      isSuiA: false,
+      isSuiB: false,
+      tickLower: -100,
+      tickUpper: 100,
+      freshTickIndexes: [50, 150],  // attempt 1: in range; attempt 2: above range
+      walletBalances: [
+        { rawA: 1_000_000n, rawB: 500_000n },  // attempt 1
+        { rawA: 1_000_000n, rawB: 500_000n },  // attempt 2
+      ],
+      // Attempt 1 (0-indexed=0) throws MoveAbort(0)
+      sdkThrowsOnAttempt: new Set([0]),
+      maxRetries: 3,
+    });
+
+    assert.ok(result.succeeded, 'Should succeed on attempt 2 after switching to token B');
+    assert.strictEqual(result.attempts, 2, 'Should take 2 attempts');
+    // Attempt 1: price in range, used A (MoveAbort thrown by mock)
+    assert.strictEqual(result.attemptAmounts[0].amountA, 1_000_000n, 'Attempt 1: used token A (in-range price)');
+    assert.strictEqual(result.attemptAmounts[0].fixAmountA, true);
+    // Attempt 2: price above range, switched to B
+    assert.strictEqual(result.attemptAmounts[1].amountA, 0n, 'Attempt 2: switched to 0 A');
+    assert.strictEqual(result.attemptAmounts[1].amountB, 500_000n, 'Attempt 2: using B after switch');
+    assert.strictEqual(result.attemptAmounts[1].fixAmountA, false, 'Attempt 2: fixAmountA=false after switch');
+    console.log('✔ Price crosses boundary mid-retry: detects and switches token on subsequent attempt → success');
   }
 
   console.log('\nAll per-retry balance-cap tests passed ✅');

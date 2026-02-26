@@ -886,10 +886,50 @@ export class RebalanceService {
           if (capA > safeRetryA) addLiquidityParams.amount_a = safeRetryA.toString();
           if (capB > safeRetryB) addLiquidityParams.amount_b = safeRetryB.toString();
 
-          // After capping, update fix_amount_a to reflect the non-zero input token.
-          // If the primary token's balance dropped to zero (e.g. SUI consumed by gas),
-          // passing (amount=0, fix_amount_a=true) to the SDK always computes zero
-          // liquidity and triggers MoveAbort(repay_add_liquidity, 0).
+          // If the price crossed the range boundary since the initial amount selection,
+          // the original fix_amount_a choice may now produce zero delta_liquidity on-chain:
+          //   - fix_amount_a=true  + price above upper tick → get_delta_liquidity_from_a = 0
+          //   - fix_amount_a=false + price below lower tick → get_delta_liquidity_from_b = 0
+          // Switch to the correct input token for the fresh price to prevent
+          // MoveAbort(repay_add_liquidity, 0).
+          const freshTickIndex = Number(freshPool.current_tick_index);
+          const freshPriceIsAboveRange = freshTickIndex >= tickUpper;
+          const freshPriceIsBelowRange = freshTickIndex < tickLower;
+
+          if (freshPriceIsAboveRange && addLiquidityParams.fix_amount_a) {
+            if (safeRetryB > 0n) {
+              // Price moved above range: only token B is needed — switch input to B.
+              addLiquidityParams.amount_a = '0';
+              addLiquidityParams.amount_b = safeRetryB.toString();
+              logger.info('Price moved above range on retry — switching input to token B', {
+                freshTickIndex, tickUpper,
+              });
+            } else {
+              throw new Error(
+                `Cannot add liquidity: price (tick ${freshTickIndex}) is above range upper tick ${tickUpper} ` +
+                'but token B balance is zero. Please add token B to your wallet.',
+              );
+            }
+          } else if (freshPriceIsBelowRange && !addLiquidityParams.fix_amount_a) {
+            if (safeRetryA > 0n) {
+              // Price moved below range: only token A is needed — switch input to A.
+              addLiquidityParams.amount_a = safeRetryA.toString();
+              addLiquidityParams.amount_b = '0';
+              logger.info('Price moved below range on retry — switching input to token A', {
+                freshTickIndex, tickLower,
+              });
+            } else {
+              throw new Error(
+                `Cannot add liquidity: price (tick ${freshTickIndex}) is below range lower tick ${tickLower} ` +
+                'but token A balance is zero. Please add token A to your wallet.',
+              );
+            }
+          }
+
+          // After capping and price-based token switching, update fix_amount_a to
+          // reflect the non-zero input token.  If the primary token's balance dropped
+          // to zero (e.g. SUI consumed by gas), passing (amount=0, fix_amount_a=true)
+          // to the SDK computes zero liquidity and triggers MoveAbort(repay_add_liquidity, 0).
           const retryAmtA = BigInt(addLiquidityParams.amount_a);
           const retryAmtB = BigInt(addLiquidityParams.amount_b);
           if (retryAmtA === 0n && retryAmtB === 0n) {
