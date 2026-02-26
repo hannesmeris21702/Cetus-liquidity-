@@ -107,7 +107,7 @@ function selectEnvZapWithValidation(opts: {
     throw new Error('Zap-in quote returned zero liquidity for configured token side');
   }
 
-  const chosen = viable[0];
+  const chosen = viable.find(q => q.token === 'A') || viable[0];
   return chosen.token === 'A'
     ? { amountA: chosen.amount, amountB: '0' }
     : { amountA: '0', amountB: chosen.amount };

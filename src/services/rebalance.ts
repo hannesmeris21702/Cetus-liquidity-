@@ -678,7 +678,7 @@ export class RebalanceService {
       }
 
       // Preserve precedence: TOKEN_A remains first when both sides are viable.
-      const chosen = viable[0];
+      const chosen = viable.find(q => q.token === 'A') || viable[0];
       let amountA: string;
       let amountB: string;
 
@@ -699,7 +699,11 @@ export class RebalanceService {
       }
 
       const otherTokenIfZero = quotes.length > 1
-        ? quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero))
+        ? quotes.find(q =>
+            q.token !== chosen.token &&
+            q.liquidity.eq(zero) &&
+            !viable.some(v => v.token === q.token),
+          )
         : undefined;
       if (otherTokenIfZero) {
         const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
