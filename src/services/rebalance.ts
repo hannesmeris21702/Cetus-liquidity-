@@ -697,14 +697,15 @@ export class RebalanceService {
         });
       }
 
-      const otherToken = quotes.length > 1
-        ? quotes.find(q => q.token !== chosen.token)
-        : undefined;
-      // Only warn when the non-selected configured token would mint zero liquidity.
-      if (otherToken && otherToken.liquidity.eq(zero)) {
-        const skippedLabel = otherToken.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
-        const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
-        logger.warn(`${skippedLabel} cannot mint liquidity at current tick — using ${chosenLabel} instead`);
+      const labelForToken = (token: 'A' | 'B') => token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
+      if (quotes.length > 1) {
+        const otherToken = quotes.find(q => q.token !== chosen.token);
+        // Only warn when the non-selected configured token would mint zero liquidity.
+        if (otherToken && otherToken.liquidity.eq(zero)) {
+          logger.warn(
+            `${labelForToken(otherToken.token)} cannot mint liquidity at current tick — using ${labelForToken(chosen.token)} instead`,
+          );
+        }
       }
 
       const isOpen = !existingPositionId;

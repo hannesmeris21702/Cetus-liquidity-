@@ -62,6 +62,7 @@ function validateTickInRange(currentTick: number, tickLower: number, tickUpper: 
  * Select the zap token side using the same zero-liquidity guard as the bot.
  * Chooses whichever env token can mint non-zero liquidity at the current tick.
  * When both sides are viable, TOKEN_A_AMOUNT keeps priority (matching the bot).
+ * This helper is intentionally duplicated here to mirror the production logic.
  * Throws when the configured token(s) would mint zero liquidity.
  */
 function selectEnvZapWithValidation(opts: {
