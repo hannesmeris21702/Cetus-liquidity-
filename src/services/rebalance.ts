@@ -631,9 +631,8 @@ export class RebalanceService {
       const currentSqrtPrice = new BN(pool.current_sqrt_price);
       const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
       const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
-      // TickMath is monotonic and tickUpper is exclusive, so the earlier range
-      // check (currentTickIndex < tickUpper) keeps currentSqrtPrice below
-      // sqrtUpperPrice for the estimators below.
+      // TickMath is monotonic and we already aborted when currentTickIndex >= tickUpper,
+      // so currentSqrtPrice remains below sqrtUpperPrice for the estimators below.
 
       logger.info('Current tick is within configured range', {
         currentTickIndex,
@@ -664,7 +663,7 @@ export class RebalanceService {
       const viable = quotes.filter(q => q.liquidity.gt(zero));
 
       if (viable.length === 0) {
-        logger.error('SDK zap-in quote predicts zero liquidity for configured token side(s)', {
+        logger.error('SDK zap-in quote predicts zero liquidity for configured token sides', {
           currentTickIndex,
           tickLower,
           tickUpper,
@@ -674,7 +673,7 @@ export class RebalanceService {
             predictedLiquidity: q.liquidity.toString(),
           })),
         });
-        throw new Error('Zap-in quote returned zero liquidity for configured token side(s)');
+        throw new Error('Zap-in quote returned zero liquidity for configured token sides');
       }
 
       // Preserve precedence: TOKEN_A remains first when both sides are viable.
@@ -698,11 +697,11 @@ export class RebalanceService {
         });
       }
 
-      const otherTokenIfZero = quotes.length > 1
-        ? quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero))
+      const otherToken = quotes.length > 1
+        ? quotes.find(q => q.token !== chosen.token)
         : undefined;
-      if (otherTokenIfZero) {
-        const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
+      if (otherToken && otherToken.liquidity.eq(zero)) {
+        const skippedLabel = otherToken.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         logger.warn(`${skippedLabel} cannot mint liquidity at current tick — using ${chosenLabel} instead`);
       }

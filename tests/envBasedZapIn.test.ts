@@ -78,7 +78,8 @@ function selectEnvZapWithValidation(opts: {
   const sqrtLower = TickMath.tickIndexToSqrtPriceX64(tickLower);
   const sqrtUpper = TickMath.tickIndexToSqrtPriceX64(tickUpper);
   const curSqrt = TickMath.tickIndexToSqrtPriceX64(currentTick);
-  // TickMath is monotonic and tickUpper is exclusive, so curSqrt stays below sqrtUpper here.
+  // TickMath is monotonic and validateTickInRange enforces an exclusive tickUpper,
+  // so curSqrt stays below sqrtUpper here.
   const zero = new BN(0);
 
   const quotes: Array<{ token: 'A' | 'B'; amount: string; liquidity: BN }> = [];
