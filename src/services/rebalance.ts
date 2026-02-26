@@ -628,7 +628,7 @@ export class RebalanceService {
         );
       }
 
-      const curSqrtPrice = new BN(pool.current_sqrt_price);
+      const currentSqrtPrice = new BN(pool.current_sqrt_price);
       const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
       const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
 
@@ -646,11 +646,11 @@ export class RebalanceService {
       const quotes: QuoteSide[] = [];
 
       if (envAmountA) {
-        const liqA = estimateLiquidityForCoinA(curSqrtPrice, sqrtUpperPrice, new BN(envAmountA));
+        const liqA = estimateLiquidityForCoinA(currentSqrtPrice, sqrtUpperPrice, new BN(envAmountA));
         quotes.push({ token: 'A', amount: envAmountA, liquidity: liqA });
       }
       if (envAmountB) {
-        const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, curSqrtPrice, new BN(envAmountB));
+        const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, currentSqrtPrice, new BN(envAmountB));
         quotes.push({ token: 'B', amount: envAmountB, liquidity: liqB });
       }
 
@@ -675,15 +675,14 @@ export class RebalanceService {
       }
 
       const chosen = viable[0];
+      const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
+      const skippedZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
       let amountA: string;
       let amountB: string;
 
       if (chosen.token === 'A') {
         amountA = chosen.amount;
         amountB = '0';
-        if (quotes.some(q => q.token === 'B' && q.liquidity.eq(zero))) {
-          logger.warn('TOKEN_B_AMOUNT cannot mint liquidity at current tick — using TOKEN_A_AMOUNT instead');
-        }
         logger.info('Using TOKEN_A_AMOUNT for zap-in', {
           amountA,
           predictedLiquidity: chosen.liquidity.toString(),
@@ -691,13 +690,15 @@ export class RebalanceService {
       } else {
         amountA = '0';
         amountB = chosen.amount;
-        if (quotes.some(q => q.token === 'A' && q.liquidity.eq(zero))) {
-          logger.warn('TOKEN_A_AMOUNT cannot mint liquidity at current tick — using TOKEN_B_AMOUNT instead');
-        }
         logger.info('Using TOKEN_B_AMOUNT for zap-in', {
           amountB,
           predictedLiquidity: chosen.liquidity.toString(),
         });
+      }
+
+      if (skippedZero) {
+        const skippedLabel = skippedZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
+        logger.warn(`${skippedLabel} cannot mint liquidity at current tick — using ${chosenLabel} instead`);
       }
 
       const isOpen = !existingPositionId;
@@ -727,7 +728,7 @@ export class RebalanceService {
 
       const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
         addLiquidityParams as any,
-        { slippage: this.config.maxSlippage, curSqrtPrice },
+        { slippage: this.config.maxSlippage, curSqrtPrice: currentSqrtPrice },
       );
       payload.setGasBudget(this.config.gasBudget);
 
