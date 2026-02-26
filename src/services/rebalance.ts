@@ -631,8 +631,9 @@ export class RebalanceService {
       const currentSqrtPrice = new BN(pool.current_sqrt_price);
       const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
       const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
-      // tickUpper is exclusive, so the earlier range check guarantees
-      // currentSqrtPrice < sqrtUpperPrice for the estimators below.
+      // TickMath is monotonic and tickUpper is exclusive, so the earlier range
+      // check (currentTickIndex < tickUpper) keeps currentSqrtPrice below
+      // sqrtUpperPrice for the estimators below.
 
       logger.info('Current tick is within configured range', {
         currentTickIndex,
@@ -697,7 +698,9 @@ export class RebalanceService {
         });
       }
 
-      const otherTokenIfZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
+      const otherTokenIfZero = quotes.length > 1
+        ? quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero))
+        : undefined;
       if (otherTokenIfZero) {
         const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
