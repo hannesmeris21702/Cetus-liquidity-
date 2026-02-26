@@ -253,7 +253,6 @@ export class RebalanceService {
           lower,
           upper,
           existingInRangePosition?.positionId,
-          closedPositionAmounts,
         );
       } catch (addLiquidityError) {
         // Add liquidity failed - if we cleared tracking, keep it cleared so bot can recover
@@ -585,116 +584,25 @@ export class RebalanceService {
     throw lastError || new Error(`All retry attempts failed for ${operationName} with unknown error`);
   }
 
-  /**
-   * Retry add liquidity transaction with fixed delay and retry on ANY error.
-   * This ensures that transient failures don't prevent liquidity from being added.
-   * 
-   * @param operation - The add liquidity operation to execute
-   * @param maxRetries - Maximum number of retry attempts (default: 3)
-   * @param delayMs - Fixed delay in milliseconds between retries (default: 3000)
-   * @returns The result of the operation
-   * @throws The original error if all retries fail
-   */
-  private async retryAddLiquidity<T>(
-    operation: () => Promise<T>,
-    maxRetries: number = 3,
-    delayMs: number = 3000
-  ): Promise<T> {
-    let lastError: Error | undefined;
-    
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const result = await operation();
-        
-        // Log success with attempt number
-        if (attempt === 1) {
-          logger.info('Add liquidity succeeded on attempt 1');
-        } else {
-          logger.info(`Add liquidity succeeded on attempt ${attempt}`);
-        }
-        
-        return result;
-      } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        lastError = error instanceof Error ? error : new Error(errorMsg);
-        
-        // MoveAbort errors are contract-level failures that cannot be resolved
-        // by retrying with the same parameters — throw immediately.
-        // Exception: MoveAbort code 0 from repay_add_liquidity or
-        // add_liquidity_fix_coin indicates zero liquidity was calculated, which
-        // can be caused by stale balance amounts. The retry refetches and
-        // re-caps balances, so subsequent attempts may succeed.
-        if (errorMsg.includes('MoveAbort') &&
-            !(/,\s*0\s*\)/.test(errorMsg) &&
-              (errorMsg.includes('repay_add_liquidity') || errorMsg.includes('add_liquidity_fix_coin')))) {
-          logger.error(`Non-retryable MoveAbort error in add liquidity: ${errorMsg}`);
-          throw error;
-        }
-
-        if (attempt < maxRetries) {
-          // Log retry attempt
-          logger.warn(`Add liquidity attempt ${attempt} failed, retrying...`);
-          logger.debug(`Error details: ${errorMsg}`);
-          
-          // Wait before retrying
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-        } else {
-          // All retries exhausted
-          logger.error(`Add liquidity failed after ${maxRetries} attempts`);
-        }
-      }
-    }
-    
-    // Preserve and throw the original error
-    throw lastError || new Error('Add liquidity failed with unknown error');
-  }
-
   /** Normalise a coin type string for comparison (lowercased, leading zeros stripped). */
   private normalizeCoinType(ct: string): string {
     return ct.toLowerCase().replace(/^0x0+/, '0x');
   }
 
   /**
-   * Calculate the amount to use for a single token in the zap call when
-   * rebalancing from a closed position.
+   * Add liquidity using the Cetus SDK zap-in method with a single execution.
    *
-   * @param removedAmount - token amount received from closing the old position
-   * @param safeBalance   - current wallet balance after reserving gas
-   * @returns amount to pass to the SDK (as a string)
-   */
-  private calculateZapAmount(removedAmount: bigint, safeBalance: bigint): string {
-    if (removedAmount <= 0n) return '0';
-    // If the balance query returned 0 but we received a positive amount from
-    // closing the position, the on-chain state may not yet be reflected in the
-    // balance RPC response.  Trust the closed-position amount so the zap can
-    // proceed with the tokens that were just returned to the wallet.
-    if (safeBalance === 0n) return removedAmount.toString();
-    return (removedAmount <= safeBalance ? removedAmount : safeBalance).toString();
-  }
-
-  /**
-   * Add liquidity using the SDK's fix-token (zap) method.
-   *
-   * The Cetus SDK zap-in requires only a single token as input.  When
-   * `fix_amount_a=true` the SDK treats `amount_a` as the full input and
-   * internally swaps the right portion to obtain the counterpart token before
-   * adding liquidity.  When `fix_amount_a=false` `amount_b` is the full input.
-   *
-   * When closedPositionAmounts are provided (rebalancing case) the freed token
-   * that matches the new price range is used as the single input:
-   *  - below-range / in-range with freed A → use freed A (capped to wallet)
-   *  - above-range / in-range with only freed B → use freed B (capped to wallet)
-   *  - both freed amounts are 0 → fall back to the matching wallet balance
-   *
-   * When no closedPositionAmounts are given (new position from scratch) the
-   * matching wallet-balance token is used.
+   * The input amount is taken exclusively from TOKEN_A_AMOUNT or TOKEN_B_AMOUNT
+   * environment variables.  Before invoking the SDK the current pool tick is
+   * validated to be within [tickLower, tickUpper); if the price is out of range
+   * the call is aborted immediately.  No retries are performed — any error
+   * (including MoveAbort code 0) propagates to the caller without retrying.
    */
   private async addLiquidity(
     poolInfo: PoolInfo,
     tickLower: number,
     tickUpper: number,
     existingPositionId?: string,
-    closedPositionAmounts?: { amountA: string; amountB: string },
   ): Promise<{ transactionDigest?: string }> {
     try {
       logger.info('Adding liquidity using zap method', {
@@ -706,137 +614,40 @@ export class RebalanceService {
       const sdk = this.sdkService.getSdk();
       const keypair = this.sdkService.getKeypair();
       const suiClient = this.sdkService.getSuiClient();
-      const ownerAddress = this.sdkService.getAddress();
 
-      // Reserve gas when a token is SUI so the transaction does not spend the
-      // entire balance and fail with balance::split.
-      const SUI_GAS_RESERVE = BigInt(this.config.gasBudget);
-      const SUI_TYPE = '0x2::sui::SUI';
-      const SUI_TYPE_FULL = '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI';
-      const isSuiCoinType = (ct: string) => ct === SUI_TYPE || ct === SUI_TYPE_FULL;
-      const isSuiA = isSuiCoinType(poolInfo.coinTypeA);
-      const isSuiB = isSuiCoinType(poolInfo.coinTypeB);
+      // Fetch current pool state and validate tick is within [tickLower, tickUpper).
+      const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
+      const currentTickIndex = Number(pool.current_tick_index);
 
-      const [balanceA, balanceB] = await Promise.all([
-        suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
-        suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
-      ]);
-
-      const rawBalanceA = BigInt(balanceA.totalBalance);
-      const rawBalanceB = BigInt(balanceB.totalBalance);
-      const safeBalanceA = isSuiA && rawBalanceA > SUI_GAS_RESERVE ? rawBalanceA - SUI_GAS_RESERVE : rawBalanceA;
-      const safeBalanceB = isSuiB && rawBalanceB > SUI_GAS_RESERVE ? rawBalanceB - SUI_GAS_RESERVE : rawBalanceB;
-
-      logger.info('Token balances', {
-        tokenA: safeBalanceA.toString(),
-        tokenB: safeBalanceB.toString(),
-        coinTypeA: poolInfo.coinTypeA,
-        coinTypeB: poolInfo.coinTypeB,
-      });
-
-      if (safeBalanceA === 0n && safeBalanceB === 0n) {
-        // When rebalancing, tokens come from the just-closed position and the
-        // balance RPC may not yet reflect the completed transaction.  Skip this
-        // guard if we have non-zero closed-position amounts to work with.
-        const hasClosedAmounts =
-          closedPositionAmounts &&
-          (BigInt(closedPositionAmounts.amountA) > 0n || BigInt(closedPositionAmounts.amountB) > 0n);
-        if (!hasClosedAmounts) {
-          throw new Error('No tokens available to add liquidity. Please ensure wallet has sufficient balance.');
-        }
+      if (currentTickIndex < tickLower || currentTickIndex >= tickUpper) {
+        throw new Error(
+          `Current tick ${currentTickIndex} is outside configured range [${tickLower}, ${tickUpper}] — aborting zap-in`,
+        );
       }
 
-      // Fetch current pool state to determine position range
-      const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
-      const currentTickIndex = pool.current_tick_index;
-      const priceIsBelowRange = currentTickIndex < tickLower;
-      const priceIsAboveRange = currentTickIndex >= tickUpper;
-
-      logger.info('Position range relative to current price', {
+      logger.info('Current tick is within configured range', {
         currentTickIndex,
         tickLower,
         tickUpper,
-        priceIsBelowRange,
-        priceIsInRange: !priceIsBelowRange && !priceIsAboveRange,
-        priceIsAboveRange,
       });
 
-      // The Cetus SDK zap-in takes a single token as input and handles the
-      // internal swap to obtain the correct A:B ratio automatically.
-      // Always pass exactly one non-zero token; set the other to '0'.
+      // Determine single-sided zap input from env vars only.
+      // TOKEN_A_AMOUNT takes priority when both are set.
+      const envAmountA = this.config.tokenAAmount;
+      const envAmountB = this.config.tokenBAmount;
       let amountA: string;
       let amountB: string;
 
-      // Env-configured token amounts take priority over closed-position amounts
-      // and wallet balance.  Single-sided input is supported: set either
-      // TOKEN_A_AMOUNT or TOKEN_B_AMOUNT (but not both).  When both are provided,
-      // TOKEN_A_AMOUNT is preferred and TOKEN_B_AMOUNT is ignored.
-      const envAmountA = this.config.tokenAAmount;
-      const envAmountB = this.config.tokenBAmount;
       if (envAmountA) {
-        // TOKEN_A_AMOUNT is set: use it as the sole input.
-        // When both vars are configured, TOKEN_A_AMOUNT takes priority.
         amountA = envAmountA;
         amountB = '0';
-        logger.info('Using TOKEN_A_AMOUNT for new position', { amountA });
+        logger.info('Using TOKEN_A_AMOUNT for zap-in', { amountA });
       } else if (envAmountB) {
-        // Only TOKEN_B_AMOUNT is set: use it as the sole input.
         amountA = '0';
         amountB = envAmountB;
-        logger.info('Using TOKEN_B_AMOUNT for new position', { amountB });
-      } else if (closedPositionAmounts) {
-        const removedA = BigInt(closedPositionAmounts.amountA);
-        const removedB = BigInt(closedPositionAmounts.amountB);
-        if (removedA > 0n || removedB > 0n) {
-          // Pick the single token the new position range requires.
-          // Below-range or in-range: prefer A. Above-range or no freed A: use B.
-          if (!priceIsAboveRange && removedA > 0n) {
-            amountA = this.calculateZapAmount(removedA, safeBalanceA);
-            amountB = '0';
-          } else {
-            amountA = '0';
-            amountB = removedB > 0n
-              ? this.calculateZapAmount(removedB, safeBalanceB)
-              : safeBalanceB.toString();
-          }
-          logger.info('Using freed position tokens for single-sided zap', {
-            removedA: closedPositionAmounts.amountA,
-            removedB: closedPositionAmounts.amountB,
-            amountA,
-            amountB,
-          });
-        } else {
-          // Balance change parsing returned 0 for both tokens — fall back to wallet balance.
-          logger.warn('Closed position amounts are both 0 — falling back to wallet balance for zap');
-          if (!priceIsAboveRange && safeBalanceA > 0n) {
-            amountA = safeBalanceA.toString();
-            amountB = '0';
-          } else {
-            amountA = '0';
-            amountB = safeBalanceB.toString();
-          }
-        }
-      } else if (priceIsBelowRange) {
-        // Below-range position: only token A is needed.
-        amountA = safeBalanceA.toString();
-        amountB = '0';
-      } else if (priceIsAboveRange) {
-        // Above-range position: only token B is needed.
-        amountA = '0';
-        amountB = safeBalanceB.toString();
+        logger.info('Using TOKEN_B_AMOUNT for zap-in', { amountB });
       } else {
-        // In-range position: prefer A; fall back to B if no A available.
-        if (safeBalanceA > 0n) {
-          amountA = safeBalanceA.toString();
-          amountB = '0';
-        } else {
-          amountA = '0';
-          amountB = safeBalanceB.toString();
-        }
-      }
-
-      if (BigInt(amountA) === 0n && BigInt(amountB) === 0n) {
-        throw new Error('Insufficient token balance for this position range. Please add tokens to your wallet.');
+        throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
       }
 
       const isOpen = !existingPositionId;
@@ -864,109 +675,31 @@ export class RebalanceService {
         fix_amount_a: addLiquidityParams.fix_amount_a,
       });
 
-      const addResult = await this.retryAddLiquidity(
-        async () => {
-          // Refetch pool state on each retry for a fresh sqrt price.
-          const freshPool = await sdk.Pool.getPool(poolInfo.poolAddress);
-          const freshSqrtPrice = new BN(freshPool.current_sqrt_price);
-
-          // Refetch wallet balances on each retry and cap the zap amount to the
-          // current safe balance.  This prevents MoveAbort(repay_add_liquidity, 0)
-          // when gas has reduced the balance since the initial amount was chosen.
-          const [retryBalA, retryBalB] = await Promise.all([
-            suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeA }),
-            suiClient.getBalance({ owner: ownerAddress, coinType: poolInfo.coinTypeB }),
-          ]);
-          const rawRetryA = BigInt(retryBalA.totalBalance);
-          const rawRetryB = BigInt(retryBalB.totalBalance);
-          const safeRetryA = isSuiA && rawRetryA > SUI_GAS_RESERVE ? rawRetryA - SUI_GAS_RESERVE : rawRetryA;
-          const safeRetryB = isSuiB && rawRetryB > SUI_GAS_RESERVE ? rawRetryB - SUI_GAS_RESERVE : rawRetryB;
-          const capA = BigInt(addLiquidityParams.amount_a);
-          const capB = BigInt(addLiquidityParams.amount_b);
-          if (capA > safeRetryA) addLiquidityParams.amount_a = safeRetryA.toString();
-          if (capB > safeRetryB) addLiquidityParams.amount_b = safeRetryB.toString();
-
-          // If the price crossed the range boundary since the initial amount selection,
-          // the original fix_amount_a choice may now produce zero delta_liquidity on-chain:
-          //   - fix_amount_a=true  + price above upper tick → get_delta_liquidity_from_a = 0
-          //   - fix_amount_a=false + price below lower tick → get_delta_liquidity_from_b = 0
-          // Switch to the correct input token for the fresh price to prevent
-          // MoveAbort(repay_add_liquidity, 0).
-          const freshTickIndex = Number(freshPool.current_tick_index);
-          const freshPriceIsAboveRange = freshTickIndex >= tickUpper;
-          const freshPriceIsBelowRange = freshTickIndex < tickLower;
-
-          if (freshPriceIsAboveRange && addLiquidityParams.fix_amount_a) {
-            if (safeRetryB > 0n) {
-              // Price moved above range: only token B is needed — switch input to B.
-              addLiquidityParams.amount_a = '0';
-              addLiquidityParams.amount_b = safeRetryB.toString();
-              logger.info('Price moved above range on retry — switching input to token B', {
-                freshTickIndex, tickUpper,
-              });
-            } else {
-              throw new Error(
-                `Cannot add liquidity: price (tick ${freshTickIndex}) is above range upper tick ${tickUpper} ` +
-                'but token B balance is zero. Please add token B to your wallet.',
-              );
-            }
-          } else if (freshPriceIsBelowRange && !addLiquidityParams.fix_amount_a) {
-            if (safeRetryA > 0n) {
-              // Price moved below range: only token A is needed — switch input to A.
-              addLiquidityParams.amount_a = safeRetryA.toString();
-              addLiquidityParams.amount_b = '0';
-              logger.info('Price moved below range on retry — switching input to token A', {
-                freshTickIndex, tickLower,
-              });
-            } else {
-              throw new Error(
-                `Cannot add liquidity: price (tick ${freshTickIndex}) is below range lower tick ${tickLower} ` +
-                'but token A balance is zero. Please add token A to your wallet.',
-              );
-            }
-          }
-
-          // After capping and price-based token switching, update fix_amount_a to
-          // reflect the non-zero input token.  If the primary token's balance dropped
-          // to zero (e.g. SUI consumed by gas), passing (amount=0, fix_amount_a=true)
-          // to the SDK computes zero liquidity and triggers MoveAbort(repay_add_liquidity, 0).
-          const retryAmtA = BigInt(addLiquidityParams.amount_a);
-          const retryAmtB = BigInt(addLiquidityParams.amount_b);
-          if (retryAmtA === 0n && retryAmtB === 0n) {
-            throw new Error('Insufficient token balance for add liquidity retry: both amounts are zero after capping to current safe balance.');
-          }
-          addLiquidityParams.fix_amount_a = retryAmtA > 0n;
-
-          const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
-            addLiquidityParams as any,
-            { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
-          );
-          payload.setGasBudget(this.config.gasBudget);
-
-          const result = await suiClient.signAndExecuteTransaction({
-            transaction: payload,
-            signer: keypair,
-            options: { showEffects: true, showEvents: true },
-          });
-
-          if (result.effects?.status?.status !== 'success') {
-            throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
-          }
-
-          return result;
-        },
-        3,
-        3000,
+      const freshSqrtPrice = new BN(pool.current_sqrt_price);
+      const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
+        addLiquidityParams as any,
+        { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
       );
+      payload.setGasBudget(this.config.gasBudget);
+
+      const result = await suiClient.signAndExecuteTransaction({
+        transaction: payload,
+        signer: keypair,
+        options: { showEffects: true, showEvents: true },
+      });
+
+      if (result.effects?.status?.status !== 'success') {
+        throw new Error(`Failed to add liquidity: ${result.effects?.status?.error || 'Unknown error'}`);
+      }
 
       logger.info('Liquidity added successfully', {
-        digest: addResult.digest,
+        digest: result.digest,
         positionId: isOpen ? '(new position)' : positionId,
         amountA,
         amountB,
       });
 
-      return { transactionDigest: addResult.digest };
+      return { transactionDigest: result.digest };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
