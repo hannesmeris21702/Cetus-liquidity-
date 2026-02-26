@@ -78,6 +78,7 @@ function selectEnvZapWithValidation(opts: {
   const sqrtLower = TickMath.tickIndexToSqrtPriceX64(tickLower);
   const sqrtUpper = TickMath.tickIndexToSqrtPriceX64(tickUpper);
   const curSqrt = TickMath.tickIndexToSqrtPriceX64(currentTick);
+  // tickUpper is exclusive, so curSqrt will always be below sqrtUpper here.
   const zero = new BN(0);
 
   const quotes: Array<{ token: 'A' | 'B'; amount: string; liquidity: BN }> = [];

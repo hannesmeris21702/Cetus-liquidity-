@@ -631,6 +631,8 @@ export class RebalanceService {
       const currentSqrtPrice = new BN(pool.current_sqrt_price);
       const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
       const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
+      // tickUpper is exclusive, so the earlier range check guarantees
+      // currentSqrtPrice < sqrtUpperPrice for the estimators below.
 
       logger.info('Current tick is within configured range', {
         currentTickIndex,
@@ -676,7 +678,6 @@ export class RebalanceService {
 
       // Preserve precedence: TOKEN_A remains first when both sides are viable.
       const chosen = viable[0];
-      const otherTokenIfZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
       let amountA: string;
       let amountB: string;
 
@@ -696,6 +697,7 @@ export class RebalanceService {
         });
       }
 
+      const otherTokenIfZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
       if (otherTokenIfZero) {
         const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
