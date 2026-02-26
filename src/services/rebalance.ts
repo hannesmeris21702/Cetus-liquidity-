@@ -3,6 +3,7 @@ import { PositionMonitorService, PoolInfo, PositionInfo } from './monitor';
 import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
+import { TickMath, estimateLiquidityForCoinA, estimateLiquidityForCoinB } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import type { BalanceChange } from '@mysten/sui/client';
 
 export interface RebalanceResult {
@@ -47,6 +48,9 @@ interface AddLiquidityFixTokenParams {
   collect_fee: boolean;
   rewarder_coin_types: string[];
 }
+
+type QuoteSide = { token: 'A' | 'B'; amount: string; liquidity: BN };
+const labelForToken = (token: 'A' | 'B') => token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
 
 export class RebalanceService {
   private sdkService: CetusSDKService;
@@ -625,29 +629,83 @@ export class RebalanceService {
         );
       }
 
+      const currentSqrtPrice = new BN(pool.current_sqrt_price);
+      const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
+      const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
+      // TickMath is monotonic and we already aborted when currentTickIndex >= tickUpper,
+      // so currentSqrtPrice remains below sqrtUpperPrice for the estimators below.
+
       logger.info('Current tick is within configured range', {
         currentTickIndex,
         tickLower,
         tickUpper,
       });
 
-      // Determine single-sided zap input from env vars only.
-      // TOKEN_A_AMOUNT takes priority when both are set.
+      // Determine single-sided zap input from env vars only, but ensure the
+      // chosen side can actually mint non-zero liquidity at the current price.
       const envAmountA = this.config.tokenAAmount;
       const envAmountB = this.config.tokenBAmount;
+      const zero = new BN(0);
+      const quotes: QuoteSide[] = [];
+
+      if (envAmountA) {
+        const liqA = estimateLiquidityForCoinA(currentSqrtPrice, sqrtUpperPrice, new BN(envAmountA));
+        quotes.push({ token: 'A', amount: envAmountA, liquidity: liqA });
+      }
+      if (envAmountB) {
+        const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, currentSqrtPrice, new BN(envAmountB));
+        quotes.push({ token: 'B', amount: envAmountB, liquidity: liqB });
+      }
+
+      if (quotes.length === 0) {
+        throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
+      }
+
+      const viable = quotes.filter(q => q.liquidity.gt(zero));
+
+      if (viable.length === 0) {
+        logger.error('SDK zap-in quote predicts zero liquidity for configured token sides', {
+          currentTickIndex,
+          tickLower,
+          tickUpper,
+          quotes: quotes.map(q => ({
+            token: q.token,
+            amount: q.amount,
+            predictedLiquidity: q.liquidity.toString(),
+          })),
+        });
+        throw new Error('Zap-in quote returned zero liquidity for configured token sides');
+      }
+
+      // Preserve precedence: TOKEN_A remains first when both sides are viable.
+      const chosen = viable.find(q => q.token === 'A') || viable[0];
       let amountA: string;
       let amountB: string;
 
-      if (envAmountA) {
-        amountA = envAmountA;
+      if (chosen.token === 'A') {
+        amountA = chosen.amount;
         amountB = '0';
-        logger.info('Using TOKEN_A_AMOUNT for zap-in', { amountA });
-      } else if (envAmountB) {
-        amountA = '0';
-        amountB = envAmountB;
-        logger.info('Using TOKEN_B_AMOUNT for zap-in', { amountB });
+        logger.info('Using TOKEN_A_AMOUNT for zap-in', {
+          amountA,
+          predictedLiquidity: chosen.liquidity.toString(),
+        });
       } else {
-        throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
+        amountA = '0';
+        amountB = chosen.amount;
+        logger.info('Using TOKEN_B_AMOUNT for zap-in', {
+          amountB,
+          predictedLiquidity: chosen.liquidity.toString(),
+        });
+      }
+
+      if (quotes.length > 1) {
+        const otherToken = quotes.find(q => q.token !== chosen.token);
+        // Only warn when the non-selected configured token would mint zero liquidity.
+        if (otherToken && otherToken.liquidity.eq(zero)) {
+          logger.warn(
+            `${labelForToken(otherToken.token)} cannot mint liquidity at current tick - using ${labelForToken(chosen.token)} instead`,
+          );
+        }
       }
 
       const isOpen = !existingPositionId;
@@ -675,10 +733,9 @@ export class RebalanceService {
         fix_amount_a: addLiquidityParams.fix_amount_a,
       });
 
-      const freshSqrtPrice = new BN(pool.current_sqrt_price);
       const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
         addLiquidityParams as any,
-        { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
+        { slippage: this.config.maxSlippage, curSqrtPrice: currentSqrtPrice },
       );
       payload.setGasBudget(this.config.gasBudget);
 

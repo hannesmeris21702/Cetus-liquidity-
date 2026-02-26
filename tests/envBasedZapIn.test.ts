@@ -13,6 +13,8 @@
  */
 
 import assert from 'assert';
+import BN from 'bn.js';
+import { TickMath, estimateLiquidityForCoinA, estimateLiquidityForCoinB } from '@cetusprotocol/cetus-sui-clmm-sdk';
 
 // ---------------------------------------------------------------------------
 // Reimplementation of the env-based amount selection and tick validation logic
@@ -54,6 +56,64 @@ function validateTickInRange(currentTick: number, tickLower: number, tickUpper: 
       `Current tick ${currentTick} is outside configured range [${tickLower}, ${tickUpper}] — aborting zap-in`,
     );
   }
+}
+
+/**
+ * Select the zap token side using the same zero-liquidity guard as the bot.
+ * Chooses whichever env token can mint non-zero liquidity at the current tick.
+ * When both sides are viable, TOKEN_A_AMOUNT keeps priority (matching the bot).
+ * This helper is intentionally duplicated here to mirror the production logic
+ * while keeping the test self-contained and independent of runtime services.
+ * Throws when the configured token(s) would mint zero liquidity.
+ */
+function selectEnvZapWithValidation(opts: {
+  envAmountA?: string;
+  envAmountB?: string;
+  tickLower: number;
+  tickUpper: number;
+  currentTick: number;
+}): { amountA: string; amountB: string } {
+  const { envAmountA, envAmountB, tickLower, tickUpper, currentTick } = opts;
+
+  validateTickInRange(currentTick, tickLower, tickUpper);
+
+  const sqrtLower = TickMath.tickIndexToSqrtPriceX64(tickLower);
+  const sqrtUpper = TickMath.tickIndexToSqrtPriceX64(tickUpper);
+  const curSqrt = TickMath.tickIndexToSqrtPriceX64(currentTick);
+  // TickMath is monotonic and validateTickInRange enforces an exclusive tickUpper,
+  // so curSqrt stays below sqrtUpper here.
+  const zero = new BN(0);
+
+  const quotes: Array<{ token: 'A' | 'B'; amount: string; liquidity: BN }> = [];
+
+  if (envAmountA) {
+    quotes.push({
+      token: 'A',
+      amount: envAmountA,
+      liquidity: estimateLiquidityForCoinA(curSqrt, sqrtUpper, new BN(envAmountA)),
+    });
+  }
+  if (envAmountB) {
+    quotes.push({
+      token: 'B',
+      amount: envAmountB,
+      liquidity: estimateLiquidityForCoinB(sqrtLower, curSqrt, new BN(envAmountB)),
+    });
+  }
+
+  if (quotes.length === 0) {
+    throw new Error('TOKEN_A_AMOUNT or TOKEN_B_AMOUNT must be configured for zap-in');
+  }
+
+  const viable = quotes.filter(q => q.liquidity.gt(zero));
+  if (viable.length === 0) {
+    throw new Error('Zap-in quote returned zero liquidity for configured token side');
+  }
+
+  const chosen = viable.find(q => q.token === 'A') || viable[0];
+  return chosen.token === 'A'
+    ? { amountA: chosen.amount, amountB: '0' }
+    : { amountA: '0', amountB: chosen.amount };
 }
 
 /**
@@ -190,9 +250,46 @@ console.log('Running env-based zap-in tests...\n');
   console.log('✔ Negative tick below range: error thrown');
 }
 
+// ── Zero-liquidity side guard (price at boundary) ────────────────────────────
+
+// 12. Price at lower tick: TOKEN_B_AMOUNT cannot mint liquidity → abort
+{
+  let thrown = false;
+  try {
+    selectEnvZapWithValidation({
+      envAmountB: '5000000',
+      tickLower: 100,
+      tickUpper: 200,
+      currentTick: 100, // at lower bound → token B mints 0 liquidity
+    });
+  } catch (err) {
+    thrown = true;
+    assert.ok(
+      err instanceof Error && err.message.includes('zero liquidity'),
+      `Expected zero-liquidity error, got ${err instanceof Error ? err.message : err}`,
+    );
+  }
+  assert.ok(thrown, 'Should abort when env token is on the zero-liquidity side');
+  console.log('✔ Lower-bound price with TOKEN_B → aborts due to zero-liquidity quote');
+}
+
+// 13. Price at lower tick with both env tokens → selects TOKEN_A automatically
+{
+  const { amountA, amountB } = selectEnvZapWithValidation({
+    envAmountA: '7000000',
+    envAmountB: '5000000',
+    tickLower: 100,
+    tickUpper: 200,
+    currentTick: 100,
+  });
+  assert.strictEqual(amountA, '7000000', 'token A is chosen because it can mint liquidity');
+  assert.strictEqual(amountB, '0', 'token B cannot mint liquidity at lower tick');
+  console.log('✔ Lower-bound price with both tokens → selects TOKEN_A (non-zero liquidity)');
+}
+
 // ── Single execution / no retry ─────────────────────────────────────────────
 
-// 12. Successful single execution
+// 14. Successful single execution
 async function runAsyncTests() {
   {
     let callCount = 0;
@@ -205,7 +302,7 @@ async function runAsyncTests() {
     console.log('✔ Single execution: SDK called exactly once on success');
   }
 
-  // 13. MoveAbort(0) propagates immediately — no retry
+  // 15. MoveAbort(0) propagates immediately — no retry
   {
     let callCount = 0;
     const moveAbort0 = new Error(
@@ -228,7 +325,7 @@ async function runAsyncTests() {
     console.log('✔ MoveAbort(0) propagates immediately without retries');
   }
 
-  // 14. Non-zero MoveAbort propagates immediately — no retry
+  // 16. Non-zero MoveAbort propagates immediately — no retry
   {
     let callCount = 0;
     const moveAbortN = new Error(
@@ -251,7 +348,7 @@ async function runAsyncTests() {
     console.log('✔ Non-zero MoveAbort propagates immediately without retries');
   }
 
-  // 15. Any arbitrary error propagates immediately — no retry
+  // 17. Any arbitrary error propagates immediately — no retry
   {
     let callCount = 0;
     const networkErr = new Error('fetch failed');
