@@ -725,10 +725,9 @@ export class RebalanceService {
         fix_amount_a: addLiquidityParams.fix_amount_a,
       });
 
-      const freshSqrtPrice = curSqrtPrice;
       const payload = await sdk.Position.createAddLiquidityFixTokenPayload(
         addLiquidityParams as any,
-        { slippage: this.config.maxSlippage, curSqrtPrice: freshSqrtPrice },
+        { slippage: this.config.maxSlippage, curSqrtPrice },
       );
       payload.setGasBudget(this.config.gasBudget);
 
