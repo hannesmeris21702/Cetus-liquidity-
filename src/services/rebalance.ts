@@ -700,6 +700,7 @@ export class RebalanceService {
       const otherToken = quotes.length > 1
         ? quotes.find(q => q.token !== chosen.token)
         : undefined;
+      // Only warn when the non-selected configured token would mint zero liquidity.
       if (otherToken && otherToken.liquidity.eq(zero)) {
         const skippedLabel = otherToken.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
