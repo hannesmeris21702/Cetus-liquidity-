@@ -699,11 +699,7 @@ export class RebalanceService {
       }
 
       const otherTokenIfZero = quotes.length > 1
-        ? quotes.find(q =>
-            q.token !== chosen.token &&
-            q.liquidity.eq(zero) &&
-            !viable.some(v => v.token === q.token),
-          )
+        ? quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero))
         : undefined;
       if (otherTokenIfZero) {
         const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
