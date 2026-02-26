@@ -674,9 +674,10 @@ export class RebalanceService {
         throw new Error('Zap-in quote returned zero liquidity for configured token side(s)');
       }
 
+      // Preserve precedence: TOKEN_A remains first when both sides are viable.
       const chosen = viable[0];
       const chosenLabel = chosen.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
-      const skippedZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
+      const otherTokenIfZero = quotes.find(q => q.token !== chosen.token && q.liquidity.eq(zero));
       let amountA: string;
       let amountB: string;
 
@@ -696,8 +697,8 @@ export class RebalanceService {
         });
       }
 
-      if (skippedZero) {
-        const skippedLabel = skippedZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
+      if (otherTokenIfZero) {
+        const skippedLabel = otherTokenIfZero.token === 'A' ? 'TOKEN_A_AMOUNT' : 'TOKEN_B_AMOUNT';
         logger.warn(`${skippedLabel} cannot mint liquidity at current tick — using ${chosenLabel} instead`);
       }
 
