@@ -4,6 +4,7 @@ import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
 import { TickMath, estimateLiquidityForCoinA, estimateLiquidityForCoinB } from '@cetusprotocol/cetus-sui-clmm-sdk';
+import type { SwapParams } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import type { BalanceChange } from '@mysten/sui/client';
 
 export interface RebalanceResult {
@@ -215,6 +216,18 @@ export class RebalanceService {
           amountA: closedPositionAmounts.amountA,
           amountB: closedPositionAmounts.amountB,
         });
+
+        // Swap tokens to the correct ratio for the new position if needed.
+        // This implements the "swap tokens if ratio incorrect" step described in the
+        // rebalancing loop: when an out-of-range position is closed we often receive
+        // only one token, but the new in-range position requires both.
+        closedPositionAmounts = await this.swapTokensIfNeeded(
+          closedPositionAmounts.amountA,
+          closedPositionAmounts.amountB,
+          poolInfo,
+          lower,
+          upper,
+        );
       } else {
         logger.info('Position has no liquidity - skipping removal step');
       }
@@ -257,6 +270,8 @@ export class RebalanceService {
           lower,
           upper,
           existingInRangePosition?.positionId,
+          closedPositionAmounts?.amountA,
+          closedPositionAmounts?.amountB,
         );
       } catch (addLiquidityError) {
         // Add liquidity failed - if we cleared tracking, keep it cleared so bot can recover
@@ -594,19 +609,214 @@ export class RebalanceService {
   }
 
   /**
+   * Swap tokens to the correct ratio before opening a new position.
+   *
+   * After removing liquidity from an out-of-range position we often receive
+   * only one token (e.g. all token B when the price moved above the old upper
+   * tick).  The new position is centred on the current price and therefore
+   * needs both tokens.  This method detects the imbalance and performs a
+   * single swap transaction to correct it:
+   *
+   *   • New position below current price: needs only token A → swap all B→A.
+   *   • New position above current price: needs only token B → swap all A→B.
+   *   • New position in range with only one token: swap half to get both.
+   *   • Already have the correct tokens: no swap.
+   *
+   * Returns the updated token amounts after the swap (or the original amounts
+   * if no swap was needed).
+   */
+  private async swapTokensIfNeeded(
+    amountA: string,
+    amountB: string,
+    poolInfo: PoolInfo,
+    tickLower: number,
+    tickUpper: number,
+  ): Promise<{ amountA: string; amountB: string }> {
+    const bigA = BigInt(amountA || '0');
+    const bigB = BigInt(amountB || '0');
+
+    if (bigA === 0n && bigB === 0n) {
+      logger.debug('No freed tokens — skipping pre-swap step');
+      return { amountA, amountB };
+    }
+
+    // Both tokens already available — the SDK zap-in will handle the ratio
+    // adjustment internally, so no explicit swap is required here.
+    if (bigA > 0n && bigB > 0n) {
+      logger.info('Both tokens available after removing liquidity — no pre-swap needed');
+      return { amountA, amountB };
+    }
+
+    // Determine current tick position relative to the new range.
+    const currentTick = poolInfo.currentTickIndex;
+    const priceIsBelowRange = currentTick < tickLower;
+    const priceIsAboveRange = currentTick >= tickUpper;
+
+    let a2b = false;         // true = sell token A for token B, false = sell token B for token A
+    let swapAmount = 0n;
+
+    if (priceIsBelowRange) {
+      if (bigA === 0n && bigB > 0n) {
+        // New position is below current price (needs only token A) but we only
+        // have token B — swap all of token B to token A.
+        a2b = false;
+        swapAmount = bigB;
+      } else {
+        logger.info('Below-range position: already have token A — no swap needed');
+        return { amountA, amountB };
+      }
+    } else if (priceIsAboveRange) {
+      if (bigB === 0n && bigA > 0n) {
+        // New position is above current price (needs only token B) but we only
+        // have token A — swap all of token A to token B.
+        a2b = true;
+        swapAmount = bigA;
+      } else {
+        logger.info('Above-range position: already have token B — no swap needed');
+        return { amountA, amountB };
+      }
+    } else {
+      // New position is in range and needs both tokens but we only have one.
+      // Swap approximately half to obtain both.
+      if (bigA > 0n && bigB === 0n) {
+        a2b = true;       // sell half of A for B
+        swapAmount = bigA / 2n;
+      } else {
+        a2b = false;      // sell half of B for A
+        swapAmount = bigB / 2n;
+      }
+      if (swapAmount === 0n) {
+        logger.info('Pre-swap amount rounds to zero — skipping swap');
+        return { amountA, amountB };
+      }
+    }
+
+    logger.info('Swapping tokens to correct ratio before opening new position', {
+      direction: a2b ? 'A→B' : 'B→A',
+      swapAmount: swapAmount.toString(),
+      currentA: bigA.toString(),
+      currentB: bigB.toString(),
+      priceIsBelowRange,
+      priceIsAboveRange,
+    });
+
+    if (this.dryRun) {
+      logger.info('[DRY RUN] Would swap tokens', {
+        direction: a2b ? 'A→B' : 'B→A',
+        swapAmount: swapAmount.toString(),
+      });
+      return { amountA, amountB };
+    }
+
+    const sdk = this.sdkService.getSdk();
+    const keypair = this.sdkService.getKeypair();
+    const suiClient = this.sdkService.getSuiClient();
+    const ownerAddress = this.sdkService.getAddress();
+
+    // Estimate minimum output using current sqrt price with slippage tolerance.
+    // price_B_per_A = (sqrtPrice / 2^64)^2 = sqrtPrice^2 / 2^128
+    const sqrtPriceBig = BigInt(new BN(poolInfo.currentSqrtPrice).toString());
+    const TWO_128 = 2n ** 128n;
+    const priceX128 = sqrtPriceBig * sqrtPriceBig;
+    const slippageFactor = BigInt(Math.floor((1 - this.config.maxSlippage) * 10000));
+
+    let minOutput: bigint;
+    if (a2b) {
+      const rawOut = priceX128 > 0n ? swapAmount * priceX128 / TWO_128 : 0n;
+      minOutput = rawOut * slippageFactor / 10000n;
+    } else {
+      const rawOut = priceX128 > 0n ? swapAmount * TWO_128 / priceX128 : 0n;
+      minOutput = rawOut * slippageFactor / 10000n;
+    }
+
+    const swapParams: SwapParams = {
+      pool_id: poolInfo.poolAddress,
+      a2b,
+      by_amount_in: true,
+      amount: swapAmount.toString(),
+      amount_limit: minOutput.toString(),
+      coinTypeA: poolInfo.coinTypeA,
+      coinTypeB: poolInfo.coinTypeB,
+    };
+    const swapPayload = await sdk.Swap.createSwapTransactionPayload(swapParams);
+    swapPayload.setGasBudget(this.config.gasBudget);
+
+    const swapResult = await suiClient.signAndExecuteTransaction({
+      transaction: swapPayload,
+      signer: keypair,
+      options: { showEffects: true, showBalanceChanges: true },
+    });
+
+    if (swapResult.effects?.status?.status !== 'success') {
+      throw new Error(`Swap transaction failed: ${swapResult.effects?.status?.error || 'Unknown error'}`);
+    }
+
+    // Parse balance changes to determine the actual amounts received.
+    const normalizedTypeA = this.normalizeCoinType(poolInfo.coinTypeA);
+    const normalizedTypeB = this.normalizeCoinType(poolInfo.coinTypeB);
+    const normalizedSuiType = this.normalizeCoinType('0x2::sui::SUI');
+
+    const gasUsed = swapResult.effects?.gasUsed;
+    const totalGasCost = gasUsed
+      ? BigInt(gasUsed.computationCost) + BigInt(gasUsed.storageCost) - BigInt(gasUsed.storageRebate)
+      : 0n;
+
+    let deltaA = 0n;
+    let deltaB = 0n;
+
+    const balanceChanges: BalanceChange[] | null | undefined = swapResult.balanceChanges;
+    if (balanceChanges) {
+      for (const change of balanceChanges) {
+        const owner = change.owner;
+        if (typeof owner !== 'object' || !('AddressOwner' in owner)) continue;
+        if ((owner as { AddressOwner: string }).AddressOwner.toLowerCase() !== ownerAddress.toLowerCase()) continue;
+        let amt = BigInt(change.amount);
+        const normalized = this.normalizeCoinType(change.coinType);
+        // Recover gross SUI amount by adding back gas cost (mirrors removeLiquidity).
+        if (amt < 0n && totalGasCost > 0n && normalized === normalizedSuiType) {
+          const gross = amt + totalGasCost;
+          amt = gross > 0n ? gross : 0n;
+        }
+        if (normalized === normalizedTypeA) deltaA += amt;
+        else if (normalized === normalizedTypeB) deltaB += amt;
+      }
+    }
+
+    const rawNewA = bigA + deltaA;
+    const rawNewB = bigB + deltaB;
+    const newAmountA = (rawNewA < 0n ? 0n : rawNewA).toString();
+    const newAmountB = (rawNewB < 0n ? 0n : rawNewB).toString();
+
+    logger.info('Pre-swap completed successfully', {
+      digest: swapResult.digest,
+      deltaA: deltaA.toString(),
+      deltaB: deltaB.toString(),
+      newAmountA,
+      newAmountB,
+    });
+
+    return { amountA: newAmountA, amountB: newAmountB };
+  }
+
+  /**
    * Add liquidity using the Cetus SDK zap-in method with a single execution.
    *
-   * The input amount is taken exclusively from TOKEN_A_AMOUNT or TOKEN_B_AMOUNT
-   * environment variables.  Before invoking the SDK the current pool tick is
-   * validated to be within [tickLower, tickUpper); if the price is out of range
-   * the call is aborted immediately.  No retries are performed — any error
-   * (including MoveAbort code 0) propagates to the caller without retrying.
+   * When freed amounts from a closed position are provided they are used as
+   * the zap input so the new position receives exactly the liquidity that was
+   * released.  If no freed amounts are provided the method falls back to the
+   * TOKEN_A_AMOUNT / TOKEN_B_AMOUNT environment variables.  Before invoking
+   * the SDK the current pool tick is validated to be within [tickLower,
+   * tickUpper); if the price is out of range the call is aborted immediately.
+   * No retries are performed — any error (including MoveAbort code 0)
+   * propagates to the caller without retrying.
    */
   private async addLiquidity(
     poolInfo: PoolInfo,
     tickLower: number,
     tickUpper: number,
     existingPositionId?: string,
+    freedAmountA?: string,
+    freedAmountB?: string,
   ): Promise<{ transactionDigest?: string }> {
     try {
       logger.info('Adding liquidity using zap method', {
@@ -641,20 +851,41 @@ export class RebalanceService {
         tickUpper,
       });
 
-      // Determine single-sided zap input from env vars only, but ensure the
-      // chosen side can actually mint non-zero liquidity at the current price.
+      // Determine single-sided zap input. Freed amounts from the closed position
+      // take priority over env-var amounts. When both are absent, fall back to
+      // env vars. The chosen side must be able to mint non-zero liquidity at the
+      // current price.
       const envAmountA = this.config.tokenAAmount;
       const envAmountB = this.config.tokenBAmount;
       const zero = new BN(0);
       const quotes: QuoteSide[] = [];
 
-      if (envAmountA) {
-        const liqA = estimateLiquidityForCoinA(currentSqrtPrice, sqrtUpperPrice, new BN(envAmountA));
-        quotes.push({ token: 'A', amount: envAmountA, liquidity: liqA });
-      }
-      if (envAmountB) {
-        const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, currentSqrtPrice, new BN(envAmountB));
-        quotes.push({ token: 'B', amount: envAmountB, liquidity: liqB });
+      const hasFreedA = freedAmountA !== undefined && BigInt(freedAmountA) > 0n;
+      const hasFreedB = freedAmountB !== undefined && BigInt(freedAmountB) > 0n;
+      // Use the validated non-undefined values directly to avoid non-null assertions.
+      const validFreedA = hasFreedA ? freedAmountA as string : undefined;
+      const validFreedB = hasFreedB ? freedAmountB as string : undefined;
+
+      if (hasFreedA || hasFreedB) {
+        // Use freed amounts from the closed position to reopen with same liquidity.
+        if (validFreedA) {
+          const liqA = estimateLiquidityForCoinA(currentSqrtPrice, sqrtUpperPrice, new BN(validFreedA));
+          quotes.push({ token: 'A', amount: validFreedA, liquidity: liqA });
+        }
+        if (validFreedB) {
+          const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, currentSqrtPrice, new BN(validFreedB));
+          quotes.push({ token: 'B', amount: validFreedB, liquidity: liqB });
+        }
+      } else {
+        // No freed amounts — use env-var configured amounts.
+        if (envAmountA) {
+          const liqA = estimateLiquidityForCoinA(currentSqrtPrice, sqrtUpperPrice, new BN(envAmountA));
+          quotes.push({ token: 'A', amount: envAmountA, liquidity: liqA });
+        }
+        if (envAmountB) {
+          const liqB = estimateLiquidityForCoinB(sqrtLowerPrice, currentSqrtPrice, new BN(envAmountB));
+          quotes.push({ token: 'B', amount: envAmountB, liquidity: liqB });
+        }
       }
 
       if (quotes.length === 0) {
@@ -677,7 +908,7 @@ export class RebalanceService {
         throw new Error('Zap-in quote returned zero liquidity for configured token sides');
       }
 
-      // Preserve precedence: TOKEN_A remains first when both sides are viable.
+      // Preserve precedence: token A remains first when both sides are viable.
       const chosen = viable.find(q => q.token === 'A') || viable[0];
       let amountA: string;
       let amountB: string;
@@ -685,14 +916,14 @@ export class RebalanceService {
       if (chosen.token === 'A') {
         amountA = chosen.amount;
         amountB = '0';
-        logger.info('Using TOKEN_A_AMOUNT for zap-in', {
+        logger.info(`Using ${hasFreedA ? 'freed' : 'configured'} token A amount for zap-in`, {
           amountA,
           predictedLiquidity: chosen.liquidity.toString(),
         });
       } else {
         amountA = '0';
         amountB = chosen.amount;
-        logger.info('Using TOKEN_B_AMOUNT for zap-in', {
+        logger.info(`Using ${hasFreedB ? 'freed' : 'configured'} token B amount for zap-in`, {
           amountB,
           predictedLiquidity: chosen.liquidity.toString(),
         });

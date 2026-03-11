@@ -64,7 +64,7 @@ export function loadConfig(): BotConfig {
     network,
     suiRpcUrl: getEnvVar('SUI_RPC_URL', false) || undefined,
     privateKey,
-    checkInterval: getEnvNumber('CHECK_INTERVAL', 300),
+    checkInterval: getEnvNumber('CHECK_INTERVAL', 60),
     rebalanceThreshold: getEnvNumber('REBALANCE_THRESHOLD', 0.05),
     poolAddress,
     positionId: getEnvVar('POSITION_ID', false) || undefined,
