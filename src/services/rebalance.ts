@@ -3,13 +3,8 @@ import { PositionMonitorService, PoolInfo, PositionInfo } from './monitor';
 import { BotConfig } from '../config';
 import { logger } from '../utils/logger';
 import BN from 'bn.js';
-import {
-  TickMath,
-  getLiquidityFromCoinA,
-  getLiquidityFromCoinB,
-  TransactionUtil,
-} from '@cetusprotocol/cetus-sui-clmm-sdk';
-import type { CoinAsset, AggregatorResult, SwapParams } from '@cetusprotocol/cetus-sui-clmm-sdk';
+import { TransactionUtil } from '@cetusprotocol/cetus-sui-clmm-sdk';
+import type { CoinAsset, SwapParams } from '@cetusprotocol/cetus-sui-clmm-sdk';
 import type { BalanceChange } from '@mysten/sui/client';
 
 export interface RebalanceResult {
@@ -175,8 +170,15 @@ export class RebalanceService {
         };
       }
 
+      // Store the exact liquidity value from the closing position so it can be
+      // reused verbatim when opening the new position.
+      const storedLiquidity = position.liquidity;
+      if (!storedLiquidity || BigInt(storedLiquidity) === 0n) {
+        throw new Error('Position liquidity is missing or zero — cannot proceed with rebalance');
+      }
+
       // Step 1: Remove liquidity from the out-of-range position.
-      await this.removeLiquidity(position.positionId, position.liquidity, poolInfo);
+      await this.removeLiquidity(position.positionId, storedLiquidity, poolInfo);
 
       // Step 2: Check actual token balances in wallet.
       const balances = await this.getWalletBalances(poolInfo.coinTypeA, poolInfo.coinTypeB);
@@ -196,13 +198,14 @@ export class RebalanceService {
         upper,
       );
 
-      // Step 4: Open new position with explicit two-step (openPosition + addLiquidity).
+      // Step 4: Open new position, reusing the exact stored liquidity value.
       const result = await this.openNewPosition(
         poolInfo,
         lower,
         upper,
         adjusted.amountA,
         adjusted.amountB,
+        storedLiquidity,
       );
 
       logger.info('Rebalance completed', {
@@ -275,7 +278,6 @@ export class RebalanceService {
         }
 
         logger.info('Remove liquidity transaction succeeded', { digest: txResult.digest });
-        return txResult;
       },
       'remove liquidity',
       3,
@@ -397,7 +399,6 @@ export class RebalanceService {
 
     // Try the Cetus aggregator first for optimal routing.
     let swapTx;
-    let aggResult: AggregatorResult | null = null;
 
     try {
       const { result } = await sdk.RouterV2.getBestRouter(
@@ -410,7 +411,6 @@ export class RebalanceService {
       );
 
       if (!result.isExceed && !result.isTimeout && result.splitPaths.length > 0) {
-        aggResult = result;
         swapTx = await TransactionUtil.buildAggregatorSwapTransaction(
           sdk,
           result,
@@ -542,11 +542,11 @@ export class RebalanceService {
   /**
    * Open a new position using an explicit two-step approach:
    *   1. openPositionTransactionPayload  → creates the position NFT
-   *   2. createAddLiquidityPayload       → deposits tokens using delta_liquidity
+   *   2. createAddLiquidityPayload       → deposits tokens using the stored delta_liquidity
    *
-   * The liquidity delta is computed from the available token amounts using
-   * standard CLMM math (getLiquidityFromCoinA / getLiquidityFromCoinB).
-   * No zap-in or internal SDK swaps are performed.
+   * The delta_liquidity is the exact value stored from the closed position — it is
+   * never recomputed from token amounts.  The wallet balances (amountA / amountB)
+   * act as max_amount_a / max_amount_b, ensuring the bot never pulls extra funds.
    */
   private async openNewPosition(
     poolInfo: PoolInfo,
@@ -554,65 +554,26 @@ export class RebalanceService {
     tickUpper: number,
     amountA: string,
     amountB: string,
+    storedLiquidity: string,
   ): Promise<{ transactionDigest?: string }> {
-    const bigA = BigInt(amountA || '0');
-    const bigB = BigInt(amountB || '0');
-
-    if (bigA === 0n && bigB === 0n) {
+    if (BigInt(amountA || '0') === 0n && BigInt(amountB || '0') === 0n) {
       throw new Error('No token amounts available to open new position');
+    }
+
+    if (!storedLiquidity || BigInt(storedLiquidity) === 0n) {
+      throw new Error('Stored liquidity value is zero — cannot open new position');
     }
 
     const sdk = this.sdkService.getSdk();
     const keypair = this.sdkService.getKeypair();
     const suiClient = this.sdkService.getSuiClient();
 
-    // Refresh pool state to get current sqrt price.
-    const pool = await sdk.Pool.getPool(poolInfo.poolAddress);
-    const currentTickIndex = Number(pool.current_tick_index);
-    const currentSqrtPrice = new BN(pool.current_sqrt_price);
-    const sqrtLowerPrice = TickMath.tickIndexToSqrtPriceX64(tickLower);
-    const sqrtUpperPrice = TickMath.tickIndexToSqrtPriceX64(tickUpper);
-
-    // Compute the liquidity delta from the available token amounts.
-    // The correct sqrt-price bounds depend on the current tick relative to the range.
-    let deltaLiquidity: BN;
-
-    if (currentTickIndex < tickLower) {
-      // Position entirely above current price — only tokenA needed.
-      deltaLiquidity = getLiquidityFromCoinA(new BN(amountA), sqrtLowerPrice, sqrtUpperPrice, false);
-    } else if (currentTickIndex >= tickUpper) {
-      // Position entirely below current price — only tokenB needed.
-      deltaLiquidity = getLiquidityFromCoinB(new BN(amountB), sqrtLowerPrice, sqrtUpperPrice, false);
-    } else {
-      // In-range position: use both tokens, take the minimum to avoid
-      // running out of either token during the on-chain add-liquidity call.
-      const liqA = bigA > 0n
-        ? getLiquidityFromCoinA(new BN(amountA), currentSqrtPrice, sqrtUpperPrice, false)
-        : new BN(0);
-      const liqB = bigB > 0n
-        ? getLiquidityFromCoinB(new BN(amountB), sqrtLowerPrice, currentSqrtPrice, false)
-        : new BN(0);
-
-      if (liqA.isZero() && liqB.isZero()) {
-        throw new Error('Calculated liquidity delta is zero for both tokens');
-      }
-      // Use the non-zero minimum.
-      if (liqA.isZero()) deltaLiquidity = liqB;
-      else if (liqB.isZero()) deltaLiquidity = liqA;
-      else deltaLiquidity = liqA.lt(liqB) ? liqA : liqB;
-    }
-
-    if (deltaLiquidity.isZero()) {
-      throw new Error('Calculated liquidity delta is zero — cannot open position');
-    }
-
     logger.info('Opening new position — step 1: create position NFT', {
       tickLower,
       tickUpper,
-      currentTickIndex,
-      deltaLiquidity: deltaLiquidity.toString(),
-      amountA,
-      amountB,
+      storedLiquidity,
+      maxAmountA: amountA,
+      maxAmountB: amountB,
     });
 
     // -----------------------------------------------------------------------
@@ -653,11 +614,13 @@ export class RebalanceService {
     logger.info('Position NFT created', { positionId: newPositionId, digest: openResult.digest });
 
     // -----------------------------------------------------------------------
-    // Step 2: Add liquidity to the new position using the computed delta.
+    // Step 2: Add liquidity using the exact stored delta_liquidity.
+    //   max_amount_a / max_amount_b are the wallet balances — the hard cap that
+    //   prevents any extra funds from being drawn from the wallet.
     // -----------------------------------------------------------------------
     logger.info('Opening new position — step 2: deposit tokens', {
       positionId: newPositionId,
-      deltaLiquidity: deltaLiquidity.toString(),
+      deltaLiquidity: storedLiquidity,
       maxAmountA: amountA,
       maxAmountB: amountB,
     });
@@ -665,7 +628,7 @@ export class RebalanceService {
     const addLiquidityParams = {
       pool_id: poolInfo.poolAddress,
       pos_id: newPositionId,
-      delta_liquidity: deltaLiquidity.toString(),
+      delta_liquidity: storedLiquidity,
       max_amount_a: amountA,
       max_amount_b: amountB,
       tick_lower: String(tickLower),
