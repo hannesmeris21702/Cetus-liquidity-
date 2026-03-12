@@ -556,12 +556,28 @@ export class RebalanceService {
     amountB: string,
     storedLiquidity: string,
   ): Promise<{ transactionDigest?: string }> {
-    if (BigInt(amountA || '0') === 0n && BigInt(amountB || '0') === 0n) {
+    // Validate that amountA and amountB are valid non-negative integer strings.
+    if (!/^\d+$/.test(amountA)) {
+      throw new Error(`Invalid amountA: "${amountA}" is not a valid non-negative integer string`);
+    }
+    if (!/^\d+$/.test(amountB)) {
+      throw new Error(`Invalid amountB: "${amountB}" is not a valid non-negative integer string`);
+    }
+
+    if (BigInt(amountA) === 0n && BigInt(amountB) === 0n) {
       throw new Error('No token amounts available to open new position');
     }
 
     if (!storedLiquidity || BigInt(storedLiquidity) === 0n) {
       throw new Error('Stored liquidity value is zero — cannot open new position');
+    }
+
+    // Validate that tickLower and tickUpper are valid integers.
+    if (!Number.isInteger(tickLower)) {
+      throw new Error(`Invalid tickLower: ${tickLower} is not a valid integer`);
+    }
+    if (!Number.isInteger(tickUpper)) {
+      throw new Error(`Invalid tickUpper: ${tickUpper} is not a valid integer`);
     }
 
     const sdk = this.sdkService.getSdk();
@@ -639,8 +655,8 @@ export class RebalanceService {
           pos_id: newPositionId,
           coinTypeA: poolInfo.coinTypeA,
           coinTypeB: poolInfo.coinTypeB,
-          amount_a: String(amountA),
-          amount_b: String(amountB),
+          amount_a: amountA,
+          amount_b: amountB,
           fix_amount_a: fix_amount_a,
           slippage: this.config.maxSlippage,
           is_open: false,
@@ -650,7 +666,32 @@ export class RebalanceService {
           rewarder_coin_types: [],
         };
 
-        const addTx = await sdk.Position.createAddLiquidityFixTokenPayload(addLiquidityParams);
+        logger.info('createAddLiquidityFixTokenPayload — parameters', {
+          pool_id: addLiquidityParams.pool_id,
+          pos_id: addLiquidityParams.pos_id,
+          coinTypeA: addLiquidityParams.coinTypeA,
+          coinTypeB: addLiquidityParams.coinTypeB,
+          amount_a: addLiquidityParams.amount_a,
+          amount_b: addLiquidityParams.amount_b,
+          fix_amount_a: addLiquidityParams.fix_amount_a,
+          slippage: addLiquidityParams.slippage,
+          is_open: addLiquidityParams.is_open,
+          tick_lower: addLiquidityParams.tick_lower,
+          tick_upper: addLiquidityParams.tick_upper,
+          collect_fee: addLiquidityParams.collect_fee,
+          rewarder_coin_types: addLiquidityParams.rewarder_coin_types,
+        });
+
+        let addTx;
+        try {
+          addTx = await sdk.Position.createAddLiquidityFixTokenPayload(addLiquidityParams);
+        } catch (sdkErr) {
+          logger.error('createAddLiquidityFixTokenPayload failed', {
+            error: sdkErr instanceof Error ? sdkErr.message : String(sdkErr),
+            params: addLiquidityParams,
+          });
+          throw sdkErr;
+        }
         addTx.setGasBudget(this.config.gasBudget);
 
         const addResult = await suiClient.signAndExecuteTransaction({

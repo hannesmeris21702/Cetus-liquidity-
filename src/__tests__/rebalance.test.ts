@@ -413,3 +413,148 @@ describe('rebalance – step 2 retries on "not available for consumption"', () =
     expect(createAddLiquidityFixTokenPayload).toHaveBeenCalledTimes(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// openNewPosition — input validation
+// ---------------------------------------------------------------------------
+
+describe('rebalance – openNewPosition input validation', () => {
+  afterEach(() => { delete process.env.DRY_RUN; });
+
+  /**
+   * Helper that sets up a rebalance run where removeLiquidity succeeds and
+   * then getBalance returns a custom totalBalance for both tokens.
+   */
+  function makeValidationScenario(balanceOverride: string, configOverride: Record<string, unknown> = {}) {
+    process.env.DRY_RUN = 'false';
+
+    const pool = makePoolInfo({ currentTickIndex: 500, tickSpacing: 10 });
+    const pos = makePosition({ tickLower: -200, tickUpper: -100, liquidity: '5000000' });
+    const monitor = makeMonitor([pos], pool);
+    (monitor.isPositionInRange as jest.Mock).mockReturnValue(false);
+    (monitor.getPositions as jest.Mock).mockResolvedValue([pos]);
+
+    const config = {
+      gasBudget: 50_000_000,
+      maxSlippage: 0.01,
+      lowerTick: 400,
+      upperTick: 600,
+      ...configOverride,
+    } as any;
+
+    const mockTxStub = { setGasBudget: jest.fn() };
+    const successEffect = { status: { status: 'success' } };
+
+    const mockSdk = {
+      Position: {
+        removeLiquidityTransactionPayload: jest.fn().mockResolvedValue(mockTxStub),
+        openPositionTransactionPayload: jest.fn().mockReturnValue(mockTxStub),
+        createAddLiquidityFixTokenPayload: jest.fn().mockResolvedValue(mockTxStub),
+        createAddLiquidityPayload: jest.fn(),
+      },
+    };
+
+    const mockSuiClient = {
+      signAndExecuteTransaction: jest.fn()
+        .mockResolvedValueOnce({ effects: successEffect, digest: '0xremove' }),
+      getBalance: jest.fn().mockResolvedValue({ totalBalance: balanceOverride }),
+    };
+
+    const sdkService = {
+      getAddress: jest.fn().mockReturnValue('0xwallet'),
+      getSdk: jest.fn().mockReturnValue(mockSdk),
+      getKeypair: jest.fn().mockReturnValue({}),
+      getSuiClient: jest.fn().mockReturnValue(mockSuiClient),
+    } as any;
+
+    return { pool, pos, monitor, config, mockSdk, mockSuiClient, sdkService };
+  }
+
+  it('returns failure when amountA is an empty string (invalid numeric)', async () => {
+    const { monitor, config, sdkService } = makeValidationScenario('');
+
+    const svc = new RebalanceService(sdkService, monitor, config);
+    const result = await svc.checkAndRebalance('0xpool');
+
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(false);
+    expect(result!.error).toMatch(/Invalid amountA/);
+  });
+
+  it('returns failure when tickLower is not an integer', async () => {
+    const { monitor, config, sdkService } = makeValidationScenario('1000000', { lowerTick: 1.5, upperTick: 600 });
+
+    const svc = new RebalanceService(sdkService, monitor, config);
+    const result = await svc.checkAndRebalance('0xpool');
+
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(false);
+    expect(result!.error).toMatch(/Invalid tickLower/);
+  });
+
+  it('returns failure when tickUpper is not an integer', async () => {
+    const { monitor, sdkService } = makeValidationScenario('1000000');
+    const config = { gasBudget: 50_000_000, maxSlippage: 0.01, lowerTick: 400, upperTick: 600.9 } as any;
+
+    const svc = new RebalanceService(sdkService, monitor, config);
+    const result = await svc.checkAndRebalance('0xpool');
+
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(false);
+    expect(result!.error).toMatch(/Invalid tickUpper/);
+  });
+
+  it('logs all params and re-throws when createAddLiquidityFixTokenPayload fails', async () => {
+    process.env.DRY_RUN = 'false';
+
+    const pool = makePoolInfo({ currentTickIndex: 500, tickSpacing: 10 });
+    const pos = makePosition({ tickLower: -200, tickUpper: -100, liquidity: '5000000' });
+    const monitor = makeMonitor([pos], pool);
+    (monitor.isPositionInRange as jest.Mock).mockReturnValue(false);
+    (monitor.getPositions as jest.Mock).mockResolvedValue([pos]);
+
+    const config = { gasBudget: 50_000_000, maxSlippage: 0.01, lowerTick: 400, upperTick: 600 } as any;
+    const mockTxStub = { setGasBudget: jest.fn() };
+    const successEffect = { status: { status: 'success' } };
+
+    const sdkError = new Error('SDK_INTERNAL: invalid coin type');
+    const createAddLiquidityFixTokenPayload = jest.fn().mockRejectedValue(sdkError);
+
+    const mockSdk = {
+      Position: {
+        removeLiquidityTransactionPayload: jest.fn().mockResolvedValue(mockTxStub),
+        openPositionTransactionPayload: jest.fn().mockReturnValue(mockTxStub),
+        createAddLiquidityFixTokenPayload,
+        createAddLiquidityPayload: jest.fn(),
+      },
+    };
+
+    const mockSuiClient = {
+      signAndExecuteTransaction: jest.fn()
+        .mockResolvedValueOnce({ effects: successEffect, digest: '0xremove' })
+        .mockResolvedValueOnce({
+          effects: successEffect,
+          digest: '0xopen',
+          objectChanges: [{ type: 'created', objectType: 'position', objectId: '0xnewpos' }],
+        }),
+      getBalance: jest.fn().mockResolvedValue({ totalBalance: '1000000' }),
+    };
+
+    const sdkService = {
+      getAddress: jest.fn().mockReturnValue('0xwallet'),
+      getSdk: jest.fn().mockReturnValue(mockSdk),
+      getKeypair: jest.fn().mockReturnValue({}),
+      getSuiClient: jest.fn().mockReturnValue(mockSuiClient),
+    } as any;
+
+    const svc = new RebalanceService(sdkService, monitor, config);
+    const result = await svc.checkAndRebalance('0xpool');
+
+    // The non-retryable SDK error should bubble up to rebalancePosition's catch
+    expect(result).not.toBeNull();
+    expect(result!.success).toBe(false);
+    expect(result!.error).toBe('SDK_INTERNAL: invalid coin type');
+    // The SDK function should have been called exactly once (non-retryable → no retry)
+    expect(createAddLiquidityFixTokenPayload).toHaveBeenCalledTimes(1);
+  });
+});
